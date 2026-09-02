@@ -1852,8 +1852,38 @@ class DynamicLossScaler:
 # Training
 # ============================================================================
 
-WEIGHTS_PATH = "TechcodeX_Weights.pt"
+WEIGHTS_PATH = "TechcodeX_Weights.pt"  # default checkpoint name, kept for backward compatibility
+CHECKPOINT_DIR = "checkpoints"
 SAVE_EVERY = 25
+
+
+def list_checkpoints() -> list:
+    """All .pt files this app could have produced — the default WEIGHTS_PATH
+    (if it exists) plus anything saved under CHECKPOINT_DIR/ under a name you
+    chose when starting a training run."""
+    found = []
+    if os.path.isfile(WEIGHTS_PATH):
+        found.append(WEIGHTS_PATH)
+    if os.path.isdir(CHECKPOINT_DIR):
+        for f in sorted(os.listdir(CHECKPOINT_DIR)):
+            if f.lower().endswith(".pt"):
+                found.append(os.path.join(CHECKPOINT_DIR, f))
+    return found
+
+
+def checkpoint_path_for_name(run_name: str) -> str:
+    """Turns a user-chosen run name into a checkpoint file path. An empty/default
+    name keeps using the original flat WEIGHTS_PATH so existing checkpoints
+    from before this feature still resolve; any other name is namespaced
+    under CHECKPOINT_DIR/ so multiple trained models don't collide."""
+    run_name = (run_name or "").strip()
+    if not run_name or run_name in ("default", "TechcodeX_Weights"):
+        return WEIGHTS_PATH
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", run_name)
+    if not safe_name.lower().endswith(".pt"):
+        safe_name += ".pt"
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    return os.path.join(CHECKPOINT_DIR, safe_name)
 
 _OOM_MESSAGE_MARKERS = ("not enough", "out of memory", "could not allocate", "resource exhausted")
 
@@ -1882,6 +1912,7 @@ def run_training_session(
     gradient_accumulation_steps: int = 1,
     use_fp16: bool = False,
     offload_optimizer_to_cpu: bool = False,
+    weights_path: str = WEIGHTS_PATH,
 ):
     """Background training generator. Yields (step, loss) after every optimizer
     step so a UI can display a live-updating loss curve.
@@ -1889,8 +1920,12 @@ def run_training_session(
     `file_path` may be a single dataset file path or a list of paths
     (.txt/.jsonl), concatenated into one training corpus.
 
+    `weights_path` is where this run's checkpoint is saved/resumed from —
+    pass a different path per run (see checkpoint_path_for_name) to train
+    multiple distinct models without overwriting each other.
+
     Starts a brand-new randomly-initialized model every call unless
-    `resume=True`, in which case it loads WEIGHTS_PATH (if present) and
+    `resume=True`, in which case it loads `weights_path` (if present) and
     continues from its saved step count. `max_steps` is how many additional
     steps THIS call runs, not a total to reach.
     """
@@ -1898,8 +1933,8 @@ def run_training_session(
     tokens = load_and_tokenize(file_path)
 
     start_step = 0
-    if resume and os.path.isfile(WEIGHTS_PATH):
-        checkpoint = load_checkpoint(WEIGHTS_PATH, map_location="cpu")
+    if resume and os.path.isfile(weights_path):
+        checkpoint = load_checkpoint(weights_path, map_location="cpu")
         config = TechcodeXConfig(**checkpoint.get("config", {}))
         if config.block_size != block_size:
             raise ValueError(
@@ -1983,7 +2018,7 @@ def run_training_session(
                     "config": config.__dict__,
                     "step": step,
                 },
-                WEIGHTS_PATH,
+                weights_path,
             )
 
         yield step, accumulated_loss / gradient_accumulation_steps
@@ -2233,6 +2268,7 @@ def run_build_dataset(documents, chunk_size, chunk_overlap, min_chunk_size, json
 def start_training(
     file_objs, existing_selected, batch_size, block_size, max_steps, learning_rate, resume,
     gradient_checkpointing, gradient_accumulation_steps, use_fp16, offload_optimizer_to_cpu,
+    run_name,
 ):
     file_paths = list(file_objs or []) + list(existing_selected or [])
     if not file_paths:
@@ -2240,6 +2276,7 @@ def start_training(
             "Please upload dataset file(s) or select existing ones from the list first."
         return
 
+    weights_path = checkpoint_path_for_name(run_name)
     history = {"step": [], "loss": []}
     try:
         for step, loss in run_training_session(
@@ -2253,11 +2290,12 @@ def start_training(
             gradient_accumulation_steps=int(gradient_accumulation_steps),
             use_fp16=bool(use_fp16),
             offload_optimizer_to_cpu=bool(offload_optimizer_to_cpu),
+            weights_path=weights_path,
         ):
             history["step"].append(step)
             history["loss"].append(loss)
             df = pd.DataFrame(history)
-            status = f"Step {step} — loss {loss:.4f}"
+            status = f"Step {step} — loss {loss:.4f} — saving to '{weights_path}'"
             yield step, loss, df, status
     except Exception as e:
         yield 0, 0.0, pd.DataFrame(history), f"Training failed: {e}"
@@ -2266,7 +2304,7 @@ def start_training(
     yield history["step"][-1] if history["step"] else 0, \
         history["loss"][-1] if history["loss"] else 0.0, \
         pd.DataFrame(history), \
-        f"Training complete. Weights saved to '{WEIGHTS_PATH}' (total step count: {history['step'][-1] if history['step'] else 0})."
+        f"Training complete. Weights saved to '{weights_path}' (total step count: {history['step'][-1] if history['step'] else 0})."
 
 
 def estimate_model_size(block_size, n_embd, n_head, n_layer):
@@ -2281,23 +2319,31 @@ def estimate_model_size(block_size, n_embd, n_head, n_layer):
     )
 
 
-def check_weights_exist():
-    if os.path.isfile(WEIGHTS_PATH):
-        size_mb = os.path.getsize(WEIGHTS_PATH) / (1024 * 1024)
-        return f"Found '{WEIGHTS_PATH}' ({size_mb:.2f} MB)."
-    return f"No weights file found at '{WEIGHTS_PATH}'. Train a model first."
+def refresh_checkpoint_list():
+    choices = list_checkpoints()
+    value = choices[0] if choices else None
+    return gr.update(choices=choices, value=value)
 
 
-def show_model_info():
-    if not os.path.isfile(WEIGHTS_PATH):
-        return f"No weights file found at '{WEIGHTS_PATH}'. Train a model first."
+def check_weights_exist(checkpoint_path):
+    checkpoint_path = checkpoint_path or WEIGHTS_PATH
+    if os.path.isfile(checkpoint_path):
+        size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
+        return f"Found '{checkpoint_path}' ({size_mb:.2f} MB)."
+    return f"No weights file found at '{checkpoint_path}'. Train a model first."
 
-    checkpoint = load_checkpoint(WEIGHTS_PATH, map_location="cpu")
+
+def show_model_info(checkpoint_path):
+    checkpoint_path = checkpoint_path or WEIGHTS_PATH
+    if not os.path.isfile(checkpoint_path):
+        return f"No weights file found at '{checkpoint_path}'. Train a model first."
+
+    checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("model_state_dict", {})
     config_dict = checkpoint.get("config", TechcodeXConfig().__dict__)
 
     total_params = sum(t.numel() for t in state_dict.values())
-    file_size_mb = os.path.getsize(WEIGHTS_PATH) / (1024 * 1024)
+    file_size_mb = os.path.getsize(checkpoint_path) / (1024 * 1024)
 
     return (
         f"Parameters: {format_param_count(total_params)} ({total_params:,} total)\n"
@@ -2309,13 +2355,14 @@ def show_model_info():
     )
 
 
-def export_hf_bundle():
-    if not os.path.isfile(WEIGHTS_PATH):
-        return f"Cannot export — '{WEIGHTS_PATH}' does not exist yet. Train a model first."
+def export_hf_bundle(checkpoint_path):
+    checkpoint_path = checkpoint_path or WEIGHTS_PATH
+    if not os.path.isfile(checkpoint_path):
+        return f"Cannot export — '{checkpoint_path}' does not exist yet. Train a model first."
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
 
-    checkpoint = load_checkpoint(WEIGHTS_PATH, map_location="cpu")
+    checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
     config_dict = checkpoint.get("config", TechcodeXConfig().__dict__)
 
     hf_config = {
@@ -2332,7 +2379,7 @@ def export_hf_bundle():
     with open(os.path.join(EXPORT_DIR, "config.json"), "w", encoding="utf-8") as f:
         json.dump(hf_config, f, indent=2)
 
-    shutil.copy2(WEIGHTS_PATH, os.path.join(EXPORT_DIR, "pytorch_model.bin"))
+    shutil.copy2(checkpoint_path, os.path.join(EXPORT_DIR, "pytorch_model.bin"))
 
     return f"Exported bundle to './{EXPORT_DIR}/' (config.json + pytorch_model.bin)."
 
@@ -2364,9 +2411,10 @@ def _write_model_card(checkpoint: dict, repo_id: str):
         f.write(readme)
 
 
-def upload_to_hf_hub(repo_id, hf_token, private, commit_message):
-    if not os.path.isfile(WEIGHTS_PATH):
-        yield f"Cannot upload — '{WEIGHTS_PATH}' does not exist yet. Train a model first."
+def upload_to_hf_hub(checkpoint_path, repo_id, hf_token, private, commit_message):
+    checkpoint_path = checkpoint_path or WEIGHTS_PATH
+    if not os.path.isfile(checkpoint_path):
+        yield f"Cannot upload — '{checkpoint_path}' does not exist yet. Train a model first."
         return
 
     repo_id = (repo_id or "").strip()
@@ -2383,9 +2431,9 @@ def upload_to_hf_hub(repo_id, hf_token, private, commit_message):
         return
 
     yield "Preparing export bundle..."
-    export_hf_bundle()
+    export_hf_bundle(checkpoint_path)
 
-    checkpoint = load_checkpoint(WEIGHTS_PATH, map_location="cpu")
+    checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
     _write_model_card(checkpoint, repo_id)
 
     try:
@@ -2407,14 +2455,19 @@ def upload_to_hf_hub(repo_id, hf_token, private, commit_message):
     yield f"Uploaded successfully -> https://huggingface.co/{repo_id}"
 
 
-def _load_chat_model():
-    global _chat_model, _chat_config
-    if not os.path.isfile(WEIGHTS_PATH):
-        return None
-    if _chat_model is not None:
-        return _chat_model
+# Keyed by checkpoint path so switching the model dropdown loads the right
+# weights instead of reusing whatever was loaded first.
+_chat_model_cache = {}
 
-    checkpoint = load_checkpoint(WEIGHTS_PATH, map_location="cpu")
+
+def _load_chat_model(checkpoint_path: str):
+    checkpoint_path = checkpoint_path or WEIGHTS_PATH
+    if not os.path.isfile(checkpoint_path):
+        return None
+    if checkpoint_path in _chat_model_cache:
+        return _chat_model_cache[checkpoint_path]
+
+    checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
     config_dict = checkpoint.get("config", TechcodeXConfig().__dict__)
     config = TechcodeXConfig(**config_dict)
 
@@ -2422,32 +2475,71 @@ def _load_chat_model():
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    _chat_model = model
-    _chat_config = config
-    return _chat_model
+    _chat_model_cache[checkpoint_path] = model
+    return model
 
 
-def chat_with_techcodex(message, temperature, history):
+def _read_context_file(context_file) -> str:
+    """Reads an uploaded file's text for the model to reference. Only plain-text
+    formats are read directly (.txt/.jsonl/.md/etc); a .pdf reuses the same
+    PDFExtractor as Tab 0."""
+    if not context_file:
+        return ""
+    path = context_file if isinstance(context_file, str) else getattr(context_file, "name", None)
+    if not path or not os.path.isfile(path):
+        return ""
+    if path.lower().endswith(".pdf"):
+        try:
+            return PDFExtractor().extract(path).raw_text
+        except Exception as e:
+            return f"[Could not read PDF: {e}]"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        return f"[Could not read file: {e}]"
+
+
+def chat_with_techcodex(message, temperature, history, checkpoint_path, context_file):
     history = history or []
 
-    model = _load_chat_model()
+    model = _load_chat_model(checkpoint_path)
     if model is None:
         history.append({"role": "user", "content": message})
         history.append({
             "role": "assistant",
-            "content": f"No trained weights found at '{WEIGHTS_PATH}'. Train a model in Tab 1 first.",
+            "content": f"No trained weights found at '{checkpoint_path or WEIGHTS_PATH}'. "
+                       f"Train a model in Tab 1 first, or pick a different checkpoint above.",
         })
         return history, ""
 
     tokenizer = get_tokenizer()
-    input_ids = tokenizer.encode(message)
+    block_size = model.config.block_size
+
+    context_text = _read_context_file(context_file)
+    prompt = message
+    if context_text.strip():
+        # Reserve room for the question itself and the reply; whatever's left
+        # of the context window is spent on the attached file's content, most
+        # recent (i.e. tail-truncated least) tokens first since a from-scratch
+        # small model attends best to nearby context.
+        reserved = len(tokenizer.encode(message)) + 60
+        budget = max(0, block_size - reserved)
+        context_ids = tokenizer.encode(context_text)[:budget]
+        if context_ids:
+            prompt = (
+                "Reference document:\n" + tokenizer.decode(context_ids) +
+                "\n\nQuestion: " + message + "\nAnswer:"
+            )
+
+    input_ids = tokenizer.encode(prompt)[-block_size:]
     idx = torch.tensor([input_ids], dtype=torch.long, device=device)
 
     out_idx = model.generate(idx, max_new_tokens=60, temperature=float(temperature))
     generated_ids = out_idx[0].tolist()[len(input_ids):]
     reply = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    history.append({"role": "user", "content": message})
+    history.append({"role": "user", "content": message + (" 📎" if context_text.strip() else "")})
     history.append({"role": "assistant", "content": reply.strip() or "(empty response)"})
     return history, ""
 
@@ -2633,6 +2725,13 @@ with gr.Blocks(title="TechcodeX") as demo:
                         interactive=False,
                         lines=3,
                     )
+                    run_name_box = gr.Textbox(
+                        value="default",
+                        label="Checkpoint name for this model",
+                        info="Use a different name per model to train several distinct models without "
+                             "overwriting each other (saved under checkpoints/<name>.pt). Leave as "
+                             "'default' to use the original TechcodeX_Weights.pt.",
+                    )
                     train_button = gr.Button("Start Training", variant="primary")
 
                 with gr.Column(scale=1):
@@ -2672,43 +2771,79 @@ with gr.Blocks(title="TechcodeX") as demo:
                     file_upload, existing_datasets_checkbox, batch_size_slider, block_size_slider,
                     max_steps_slider, lr_slider, resume_checkbox,
                     gradient_checkpointing_checkbox, gradient_accumulation_slider, use_fp16_checkbox,
-                    offload_optimizer_checkbox,
+                    offload_optimizer_checkbox, run_name_box,
                 ],
                 outputs=[step_display, loss_display, loss_plot, training_status],
             )
 
         with gr.Tab("Tab 2: Model Testing & Weights"):
             with gr.Row():
+                checkpoint_dropdown_tab2 = gr.Dropdown(
+                    choices=list_checkpoints(), label="Checkpoint", scale=3,
+                    value=(list_checkpoints() or [None])[0],
+                )
+                refresh_checkpoints_button_tab2 = gr.Button("Refresh", scale=1)
+            refresh_checkpoints_button_tab2.click(fn=refresh_checkpoint_list, outputs=checkpoint_dropdown_tab2)
+
+            with gr.Row():
                 with gr.Column():
                     check_button = gr.Button("Check Weights File")
                     check_output = gr.Textbox(label="Weights Status", interactive=False)
-                    check_button.click(fn=check_weights_exist, outputs=check_output)
+                    check_button.click(fn=check_weights_exist, inputs=checkpoint_dropdown_tab2, outputs=check_output)
 
                 with gr.Column():
                     export_button = gr.Button("Export Hugging Face-style Bundle")
                     export_output = gr.Textbox(label="Export Status", interactive=False)
-                    export_button.click(fn=export_hf_bundle, outputs=export_output)
+                    export_button.click(fn=export_hf_bundle, inputs=checkpoint_dropdown_tab2, outputs=export_output)
 
                 with gr.Column():
                     model_info_button = gr.Button("Show Model Size")
                     model_info_output = gr.Textbox(label="Model Size", interactive=False, lines=5)
-                    model_info_button.click(fn=show_model_info, outputs=model_info_output)
+                    model_info_button.click(fn=show_model_info, inputs=checkpoint_dropdown_tab2, outputs=model_info_output)
 
         with gr.Tab("Tab 3: Chat with Eather"):
+            with gr.Row():
+                checkpoint_dropdown_tab3 = gr.Dropdown(
+                    choices=list_checkpoints(), label="Model to chat with", scale=3,
+                    value=(list_checkpoints() or [None])[0],
+                )
+                refresh_checkpoints_button_tab3 = gr.Button("Refresh", scale=1)
+            refresh_checkpoints_button_tab3.click(fn=refresh_checkpoint_list, outputs=checkpoint_dropdown_tab3)
+
+            context_file_upload = gr.File(
+                label="Attach a file for the model to reference (optional) — .txt/.jsonl/.md/.pdf",
+                file_types=[".txt", ".jsonl", ".md", ".pdf"],
+            )
+            gr.Markdown(
+                "*The attached file's text is fed in as context so the model can answer questions "
+                "about it — limited by the model's context length (block_size), so only the portion "
+                "that fits is used. A from-scratch small model's ability to actually use that context "
+                "well depends heavily on how much it's been trained.*"
+            )
+
             chatbot = gr.Chatbot(label="Eather (TechcodeX)", height=400)
             with gr.Row():
                 chat_input = gr.Textbox(label="Message", placeholder="Say something...", scale=4)
                 send_button = gr.Button("Send", variant="primary", scale=1)
             temperature_slider = gr.Slider(0.1, 2.0, value=0.8, step=0.05, label="Creativity Temperature")
 
-            send_button.click(fn=chat_with_techcodex, inputs=[chat_input, temperature_slider, chatbot], outputs=[chatbot, chat_input])
-            chat_input.submit(fn=chat_with_techcodex, inputs=[chat_input, temperature_slider, chatbot], outputs=[chatbot, chat_input])
+            chat_inputs = [chat_input, temperature_slider, chatbot, checkpoint_dropdown_tab3, context_file_upload]
+            send_button.click(fn=chat_with_techcodex, inputs=chat_inputs, outputs=[chatbot, chat_input])
+            chat_input.submit(fn=chat_with_techcodex, inputs=chat_inputs, outputs=[chatbot, chat_input])
 
         with gr.Tab("Tab 4: Upload to Hugging Face"):
             gr.Markdown(
                 "Pushes the trained checkpoint to the Hugging Face Hub as a model repo "
                 "(config.json + pytorch_model.bin + an auto-generated model card)."
             )
+            with gr.Row():
+                checkpoint_dropdown_tab4 = gr.Dropdown(
+                    choices=list_checkpoints(), label="Checkpoint to upload", scale=3,
+                    value=(list_checkpoints() or [None])[0],
+                )
+                refresh_checkpoints_button_tab4 = gr.Button("Refresh", scale=1)
+            refresh_checkpoints_button_tab4.click(fn=refresh_checkpoint_list, outputs=checkpoint_dropdown_tab4)
+
             with gr.Row():
                 hf_upload_repo_id_box = gr.Textbox(label="Repo id", placeholder="e.g. yourname/techcodex-model", scale=2)
                 hf_upload_private_checkbox = gr.Checkbox(value=True, label="Private repository", scale=1)
@@ -2719,7 +2854,7 @@ with gr.Blocks(title="TechcodeX") as demo:
 
             hf_upload_button.click(
                 fn=upload_to_hf_hub,
-                inputs=[hf_upload_repo_id_box, hf_upload_token_box, hf_upload_private_checkbox, hf_upload_commit_message_box],
+                inputs=[checkpoint_dropdown_tab4, hf_upload_repo_id_box, hf_upload_token_box, hf_upload_private_checkbox, hf_upload_commit_message_box],
                 outputs=hf_upload_status,
             )
 
