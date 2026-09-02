@@ -263,6 +263,13 @@ class TechcodeXModel(nn.Module):
         self.gradient_checkpointing = enabled
 
     def _init_weights(self, module: nn.Module):
+        # Meta-device tensors (see describe_model_size) have shapes but no
+        # real storage — there's nothing to fill in, and init ops would
+        # error trying. Skip: whoever builds a meta-device model only wants
+        # parameter counts, not usable weights.
+        weight = getattr(module, "weight", None)
+        if weight is not None and weight.is_meta:
+            return
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
@@ -345,7 +352,14 @@ class TechcodeXModel(nn.Module):
 
 
 def describe_model_size(config: TechcodeXConfig) -> dict:
-    model = TechcodeXModel(config)
+    """Builds the model on torch's "meta" device — real tensor shapes (so
+    .numel() and parameter counts are exact), but no actual memory allocated
+    and no weight values computed. Building a billion-parameter model for
+    real on CPU (allocating + randomly initializing every weight) just to
+    count parameters was taking real, noticeable time; on meta it's instant
+    regardless of model size."""
+    with torch.device("meta"):
+        model = TechcodeXModel(config)
     total_params = model.count_parameters()
     trainable_params = model.count_parameters(trainable_only=True)
     del model
