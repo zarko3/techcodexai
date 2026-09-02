@@ -271,7 +271,16 @@ class TechcodeXModel(nn.Module):
 
         for block in self.blocks:
             if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+                # preserve_rng_state=True (the default) makes checkpoint() call
+                # getattr(torch, device.type) to save/restore RNG state for the
+                # recompute pass — that works for "cuda"/"cpu" but there is no
+                # torch.xla submodule (torch_xla is a separate package), so it
+                # raises "module 'torch' has no attribute 'xla'" on TPU. Disabling
+                # it there only means the recomputed dropout mask during backward
+                # can differ from the forward pass's mask, not a correctness bug.
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, use_reentrant=False, preserve_rng_state=(_DEVICE_KIND != "xla")
+                )
             else:
                 x = block(x)
 
