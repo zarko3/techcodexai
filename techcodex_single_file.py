@@ -270,17 +270,17 @@ class TechcodeXModel(nn.Module):
         x = self.drop(tok_emb + pos_emb)
 
         for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
-                # preserve_rng_state=True (the default) makes checkpoint() call
-                # getattr(torch, device.type) to save/restore RNG state for the
-                # recompute pass — that works for "cuda"/"cpu" but there is no
-                # torch.xla submodule (torch_xla is a separate package), so it
-                # raises "module 'torch' has no attribute 'xla'" on TPU. Disabling
-                # it there only means the recomputed dropout mask during backward
-                # can differ from the forward pass's mask, not a correctness bug.
-                x = torch.utils.checkpoint.checkpoint(
-                    block, x, use_reentrant=False, preserve_rng_state=(_DEVICE_KIND != "xla")
-                )
+            # torch.utils.checkpoint always resolves a "device module" for
+            # autocast/RNG bookkeeping via getattr(torch, device.type) — even
+            # with preserve_rng_state=False — and there is no torch.xla
+            # submodule (torch_xla is a separate top-level package, not
+            # merged into torch's namespace), so it raises "module 'torch'
+            # has no attribute 'xla'" on TPU no matter what. Skip
+            # checkpointing entirely on XLA; TPU HBM is large enough at this
+            # model size that it's not needed there the way it is on a
+            # VRAM-constrained GPU.
+            if self.gradient_checkpointing and self.training and _DEVICE_KIND != "xla":
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
             else:
                 x = block(x)
 
@@ -2623,7 +2623,7 @@ with gr.Blocks(title="TechcodeX") as demo:
                         "**Out of accelerator memory?** Enable Gradient Checkpointing and/or lower "
                         "Batch Size while raising Gradient Accumulation Steps by the same factor."
                     )
-                    gradient_checkpointing_checkbox = gr.Checkbox(value=True, label="Gradient Checkpointing (recommended at 1B scale)")
+                    gradient_checkpointing_checkbox = gr.Checkbox(value=True, label="Gradient Checkpointing (CUDA/DirectML/CPU only — no-op on TPU)")
                     gradient_accumulation_slider = gr.Slider(1, 128, value=8, step=1, label="Gradient Accumulation Steps")
                     use_fp16_checkbox = gr.Checkbox(value=False, label="Train in fp16 (DirectML/CUDA; ignored on TPU)")
                     offload_optimizer_checkbox = gr.Checkbox(value=False, label="Offload Optimizer State to CPU (DirectML only)")
