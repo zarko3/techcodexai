@@ -7,34 +7,40 @@ be pasted straight into a Google Colab cell (with a TPU runtime) or run
 locally on Windows (CUDA / AMD DirectML / CPU).
 
 Colab TPU quick start (in a notebook cell, before this file's code):
-    # Do NOT pin torch to a specific version here — torch_xla's compiled C
-    # extension (_XLAC.so) is built against one exact torch build, and
-    # pinning torch separately (e.g. torch~=2.4) can pull a mismatched
-    # version, causing "undefined symbol" ImportErrors. Let pip resolve
-    # torch from torch_xla's own dependency instead.
-    !pip install -q "torch_xla[tpu]" -f https://storage.googleapis.com/libtpu-releases/index.html
+    # torch_xla's compiled C extension (_XLAC.so) is built against one exact
+    # torch release and does NOT declare torch as a pip dependency, so both
+    # must be installed together, pinned to the SAME version — otherwise you
+    # get "undefined symbol" ImportErrors. Check what torch_xla version is
+    # already on the image first (`!pip show torch_xla`) and match it below;
+    # 2.8.0 is current as of this writing.
+    !pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" -f https://storage.googleapis.com/libtpu-releases/index.html
     !pip install -q transformers datasets gradio huggingface_hub
 
 Local Windows quick start:
-    pip install torch transformers datasets gradio huggingface_hub
+    pip install torch transformers datasets gradio huggingface_hub pymupdf pytesseract Pillow langdetect
     pip install torch-directml   # optional, for AMD GPUs
 
 Then just: python techcodex_single_file.py
 
-Dataset prep in this build is intentionally minimal — plain .txt / .jsonl
-upload, or a straight download-and-chunk from a Hugging Face Hub dataset.
-The full PDF/OCR/quality-filtering pipeline lives in the multi-file version
-of this project (dataset_prep/) and is not duplicated here, since none of
-that runs usefully on a Colab TPU runtime anyway.
+Includes the full dataset-prep pipeline: PDF/image OCR extraction, text
+cleaning (headers/footers, page numbers, markup, web boilerplate), quality
+filtering + deduplication, paragraph-aware chunking, and Hugging Face Hub
+dataset download — all run through the same cleaning pass. OCR (Tab 0, image
+files) needs the Tesseract engine installed separately: `!apt-get install -y
+tesseract-ocr` on Colab, or see setup_env.ps1 on Windows.
 """
 
+import hashlib
 import io
 import json
 import math
 import os
+import re
 import shutil
 import sys
-from dataclasses import dataclass
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass, field
 
 import pandas as pd
 import torch
@@ -350,6 +356,1084 @@ def get_tokenizer():
 
 
 # ============================================================================
+# Dataset preparation pipeline — PDF/image OCR extraction, text cleaning,
+# quality filtering, and paragraph-aware chunking.
+#
+# Pipeline: source file(s) -> text extraction -> cleaning -> quality filter
+# -> chunking -> JSONL. Also used by download_hf_dataset() below, so local
+# files and Hugging Face Hub datasets go through the exact same cleaning
+# pass.
+# ============================================================================
+
+@dataclass
+class ExtractedPage:
+    index: int
+    text: str
+
+
+@dataclass
+class ExtractionResult:
+    source_path: str
+    page_count: int
+    pages: list  # list[ExtractedPage]
+    raw_text: str
+    warnings: list = field(default_factory=list)
+
+
+class BaseExtractor:
+    """Interface every source-type extractor must implement."""
+
+    supported_extensions: tuple = ()
+
+    def extract(self, file_path: str) -> ExtractionResult:
+        raise NotImplementedError
+
+
+class PDFExtractor(BaseExtractor):
+    """Extracts text from born-digital PDFs using PyMuPDF."""
+
+    supported_extensions = (".pdf",)
+
+    # Below this average extractable-characters-per-page, the PDF is likely
+    # scanned/image-based and needs OCR rather than direct text extraction.
+    MIN_CHARS_PER_PAGE_OCR_THRESHOLD = 20
+
+    def extract(self, file_path: str) -> ExtractionResult:
+        try:
+            import pymupdf as fitz  # PyMuPDF (modern import name)
+        except ImportError:
+            try:
+                import fitz  # older PyMuPDF releases
+            except ImportError as e:
+                raise RuntimeError(
+                    "PyMuPDF is required for PDF extraction. Install it with: pip install pymupdf"
+                ) from e
+
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"PDF file not found: {file_path}")
+
+        warnings = []
+
+        try:
+            doc = fitz.open(file_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open PDF '{file_path}': {e}") from e
+
+        try:
+            page_count = doc.page_count
+            if page_count == 0:
+                raise RuntimeError(f"PDF '{file_path}' has zero pages.")
+
+            pages = []
+            total_chars = 0
+            for i in range(page_count):
+                page = doc.load_page(i)
+                text = page.get_text("text") or ""
+                pages.append(ExtractedPage(index=i, text=text))
+                total_chars += len(text.strip())
+
+            avg_chars_per_page = total_chars / page_count
+            if avg_chars_per_page < self.MIN_CHARS_PER_PAGE_OCR_THRESHOLD:
+                warnings.append(
+                    f"Very little extractable text found ({avg_chars_per_page:.1f} chars/page avg). "
+                    "This PDF is likely scanned/image-based and may require OCR before it is usable."
+                )
+        finally:
+            doc.close()
+
+        raw_text = "\n\n".join(p.text for p in pages)
+
+        if not raw_text.strip():
+            warnings.append("No extractable text found in this PDF at all — OCR is required.")
+
+        return ExtractionResult(
+            source_path=file_path,
+            page_count=page_count,
+            pages=pages,
+            raw_text=raw_text,
+            warnings=warnings,
+        )
+
+
+class ImageExtractor(BaseExtractor):
+    """OCR-based extractor for standalone image files that have no native text layer.
+
+    Requires the Tesseract OCR ENGINE installed separately and on PATH
+    (`pip install pytesseract` only installs the Python wrapper) — not
+    available by default on Colab. Local Windows use: see setup_env.ps1.
+    """
+
+    supported_extensions = (".png", ".jpg", ".jpeg")
+
+    def extract(self, file_path: str) -> ExtractionResult:
+        try:
+            import pytesseract
+            from PIL import Image
+        except ImportError as e:
+            raise RuntimeError(
+                "OCR support requires 'pytesseract' and 'Pillow'. Install with: "
+                "pip install pytesseract Pillow"
+            ) from e
+
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Image file not found: {file_path}")
+
+        warnings = []
+        try:
+            image = Image.open(file_path)
+            text = pytesseract.image_to_string(image) or ""
+        except pytesseract.TesseractNotFoundError as e:
+            raise RuntimeError(
+                "The Tesseract OCR engine is not installed (or not on PATH) on this machine. "
+                "'pip install pytesseract' only installs the Python wrapper — the engine itself "
+                "must be installed separately. On Windows, get it from: "
+                "https://github.com/UB-Mannheim/tesseract/wiki, then add its install folder to PATH. "
+                "On Colab: !apt-get install -y tesseract-ocr"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to OCR image '{file_path}': {e}") from e
+
+        if not text.strip():
+            warnings.append(
+                "OCR found no readable text in this image — it may be a photo with no text, "
+                "low resolution, or handwriting OCR can't read."
+            )
+
+        return ExtractionResult(
+            source_path=file_path,
+            page_count=1,
+            pages=[ExtractedPage(index=0, text=text)],
+            raw_text=text,
+            warnings=warnings,
+        )
+
+
+class TxtExtractor(BaseExtractor):
+    """Passes plain text files through as a single page, still eligible for the cleaning pass."""
+
+    supported_extensions = (".txt",)
+
+    def extract(self, file_path: str) -> ExtractionResult:
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Text file not found: {file_path}")
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception as e:
+            raise RuntimeError(f"Failed to read text file '{file_path}': {e}") from e
+
+        warnings = []
+        if not text.strip():
+            warnings.append("This text file is empty.")
+
+        return ExtractionResult(
+            source_path=file_path,
+            page_count=1,
+            pages=[ExtractedPage(index=0, text=text)],
+            raw_text=text,
+            warnings=warnings,
+        )
+
+
+EXTRACTOR_REGISTRY: dict = {}
+
+
+def register_extractor(extractor: BaseExtractor):
+    for ext in extractor.supported_extensions:
+        EXTRACTOR_REGISTRY[ext.lower()] = extractor
+
+
+def get_extractor_for(file_path: str) -> BaseExtractor:
+    ext = os.path.splitext(file_path)[1].lower()
+    extractor = EXTRACTOR_REGISTRY.get(ext)
+    if extractor is None:
+        raise ValueError(
+            f"No extractor registered for file extension '{ext}'. "
+            f"Supported: {sorted(EXTRACTOR_REGISTRY.keys())}"
+        )
+    return extractor
+
+
+register_extractor(PDFExtractor())
+register_extractor(ImageExtractor())
+register_extractor(TxtExtractor())
+
+
+# --- Cleaning ---
+
+_PAGE_NUMBER_RE = re.compile(
+    r"^\s*(?:page\s+)?[\-–—]?\s*\d{1,4}\s*(?:of\s*\d{1,4})?\s*[\-–—]?\s*$",
+    re.IGNORECASE,
+)
+_ROMAN_NUMERAL_RE = re.compile(r"^\s*[ivxlcdm]{1,6}\s*$", re.IGNORECASE)
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_MULTI_SPACE_RE = re.compile(r"[ \t]+")
+_MULTI_BLANK_LINE_RE = re.compile(r"\n{3,}")
+_HYPHEN_BREAK_RE = re.compile(r"(\w)-\n(\w)")
+
+_TAG_BLOCK_RE = re.compile(r"<(script|style|svg)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_ANY_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9:_-]*(?:\s+[^<>]*)?/?>")
+_XML_DECL_RE = re.compile(r"<\?xml[^>]*\?>", re.IGNORECASE)
+_HTML_ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9a-fA-F]+);")
+_ISOLATED_MARKUP_WORD_RE = re.compile(r"^\s*(?:svg|html|xml)\s*$", re.IGNORECASE)
+
+_WEB_ARTIFACT_LINE_RE = re.compile(
+    r"^\s*(cookie policy|accept cookies|we use cookies|all rights reserved|click here|"
+    r"share (this|on) (facebook|twitter|linkedin|reddit)?|subscribe to our newsletter|"
+    r"terms of (service|use)|privacy policy|skip to (main )?content|"
+    r"javascript:void\(0\)|advertisement|sponsored content|read more|back to top|"
+    r"sign up|log in|menu|navigation)\s*$",
+    re.IGNORECASE,
+)
+_BARE_URL_LINE_RE = re.compile(r"^\s*(?:https?://|www\.)\S+\s*$", re.IGNORECASE)
+
+
+def contains_markup(text: str) -> bool:
+    return bool(_ANY_TAG_RE.search(text))
+
+
+def strip_markup(text: str) -> str:
+    """Removes actual HTML/SVG/XML tag syntax and isolated bare-keyword lines
+    (a line that is only 'svg'/'html'/'xml'). Never touches those words when
+    they appear as part of ordinary prose."""
+    text = _TAG_BLOCK_RE.sub(" ", text)
+    text = _XML_DECL_RE.sub(" ", text)
+    text = _ANY_TAG_RE.sub(" ", text)
+    text = _HTML_ENTITY_RE.sub(" ", text)
+    kept = [line for line in text.splitlines() if not _ISOLATED_MARKUP_WORD_RE.match(line)]
+    return "\n".join(kept)
+
+
+def strip_web_artifacts(text: str) -> str:
+    """Drops boilerplate nav/legal/share lines and bare-URL-only lines."""
+    kept = []
+    for line in text.splitlines():
+        s = line.strip()
+        if _WEB_ARTIFACT_LINE_RE.match(s) or _BARE_URL_LINE_RE.match(s):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+@dataclass
+class CleaningResult:
+    text: str
+    warnings: list = field(default_factory=list)
+    removed_header_footer_lines: list = field(default_factory=list)
+
+
+def _detect_repeated_lines(
+    pages_text: list,
+    edge_lines: int = 2,
+    min_page_count: int = 4,
+    frequency_threshold: float = 0.6,
+) -> set:
+    """Find short lines that repeat near the top/bottom of most pages — headers/footers."""
+    if len(pages_text) < min_page_count:
+        return set()
+
+    counter = Counter()
+    for text in pages_text:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        edge = lines[:edge_lines] + lines[-edge_lines:]
+        for line in set(edge):
+            if line.isdigit() or len(line) < 3:
+                continue
+            counter[line] += 1
+
+    threshold = max(min_page_count, int(len(pages_text) * frequency_threshold))
+    return {line for line, count in counter.items() if count >= threshold}
+
+
+def _remove_repeated_lines(text: str, repeated: set) -> str:
+    if not repeated:
+        return text
+    return "\n".join(l for l in text.splitlines() if l.strip() not in repeated)
+
+
+def _strip_page_number_lines(text: str) -> str:
+    kept = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and (_PAGE_NUMBER_RE.match(stripped) or _ROMAN_NUMERAL_RE.match(stripped)):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _dehyphenate(text: str) -> str:
+    """Rejoin words that were hard-wrapped across a hyphen, e.g. 'exam-\\nple' -> 'example'."""
+    return _HYPHEN_BREAK_RE.sub(r"\1\2", text)
+
+
+def _reflow_paragraphs(text: str) -> str:
+    """Join hard-wrapped lines within a paragraph while preserving blank-line paragraph breaks."""
+    blocks = re.split(r"\n\s*\n", text)
+    reflowed = []
+    for block in blocks:
+        lines = [l.strip() for l in block.splitlines() if l.strip()]
+        if lines:
+            reflowed.append(" ".join(lines))
+    return "\n\n".join(reflowed)
+
+
+def clean_extraction(
+    result: ExtractionResult,
+    remove_headers_footers: bool = True,
+    remove_page_numbers: bool = True,
+    normalize_unicode: bool = True,
+    remove_markup: bool = True,
+    remove_web_artifacts: bool = True,
+) -> CleaningResult:
+    warnings = list(result.warnings)
+    pages_text = [p.text for p in result.pages]
+
+    repeated_lines = set()
+    if remove_headers_footers:
+        repeated_lines = _detect_repeated_lines(pages_text)
+        if repeated_lines:
+            warnings.append(f"Removed {len(repeated_lines)} repeated header/footer line(s).")
+
+    cleaned_pages = []
+    for text in pages_text:
+        t = _remove_repeated_lines(text, repeated_lines) if repeated_lines else text
+        if remove_page_numbers:
+            t = _strip_page_number_lines(t)
+        if remove_markup:
+            t = strip_markup(t)
+        if remove_web_artifacts:
+            t = strip_web_artifacts(t)
+        cleaned_pages.append(t)
+
+    joined = "\n\n".join(cleaned_pages)
+
+    joined = _CONTROL_CHARS_RE.sub("", joined)
+    joined = joined.replace("�", "")
+
+    joined = _dehyphenate(joined)
+    joined = _reflow_paragraphs(joined)
+
+    if normalize_unicode:
+        joined = unicodedata.normalize("NFKC", joined)
+
+    joined = _MULTI_SPACE_RE.sub(" ", joined)
+    joined = _MULTI_BLANK_LINE_RE.sub("\n\n", joined)
+    joined = "\n\n".join(p.strip() for p in joined.split("\n\n") if p.strip())
+
+    if not joined.strip():
+        warnings.append("Cleaned text is empty — this file will be excluded from the dataset.")
+
+    return CleaningResult(
+        text=joined,
+        warnings=warnings,
+        removed_header_footer_lines=sorted(repeated_lines),
+    )
+
+
+# --- Chunking ---
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+@dataclass
+class Chunk:
+    text: str
+    token_count: int
+
+
+def split_paragraphs(text: str) -> list:
+    return [p.strip() for p in text.split("\n\n") if p.strip()]
+
+
+def _split_oversized_paragraph(paragraph: str, chunk_size: int, tokenizer) -> list:
+    """A single paragraph larger than chunk_size: pack by sentence, hard-split only as last resort."""
+    sentences = _SENTENCE_SPLIT_RE.split(paragraph)
+    pieces = []
+    current = ""
+    for sent in sentences:
+        candidate = (current + " " + sent).strip() if current else sent
+        if current and len(tokenizer.encode(candidate)) > chunk_size:
+            pieces.append(current)
+            current = sent
+        else:
+            current = candidate
+    if current:
+        pieces.append(current)
+
+    final_pieces = []
+    for piece in pieces:
+        ids = tokenizer.encode(piece)
+        if len(ids) <= chunk_size:
+            final_pieces.append(piece)
+        else:
+            for i in range(0, len(ids), chunk_size):
+                final_pieces.append(tokenizer.decode(ids[i:i + chunk_size]))
+    return final_pieces
+
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 512,
+    chunk_overlap: int = 50,
+    min_chunk_size: int = 64,
+    tokenizer=None,
+) -> list:
+    """Returns a list[Chunk]. Never raises on empty input — just returns []."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        raise ValueError("chunk_overlap must be >= 0 and less than chunk_size")
+    if min_chunk_size < 0 or min_chunk_size > chunk_size:
+        raise ValueError("min_chunk_size must be between 0 and chunk_size")
+
+    if not text.strip():
+        return []
+
+    tokenizer = tokenizer or get_tokenizer()
+
+    paragraphs = split_paragraphs(text)
+    if not paragraphs:
+        return []
+
+    expanded = []
+    for p in paragraphs:
+        if len(tokenizer.encode(p)) > chunk_size:
+            expanded.extend(_split_oversized_paragraph(p, chunk_size, tokenizer))
+        else:
+            expanded.append(p)
+    paragraphs = expanded
+
+    chunks: list = []
+    current_paragraphs: list = []
+    current_tokens = 0
+
+    def flush():
+        nonlocal current_paragraphs, current_tokens
+        if not current_paragraphs:
+            return
+        chunks.append(Chunk(text="\n\n".join(current_paragraphs), token_count=current_tokens))
+        current_paragraphs = []
+        current_tokens = 0
+
+    for p in paragraphs:
+        p_tokens = len(tokenizer.encode(p))
+
+        if current_paragraphs and current_tokens + p_tokens > chunk_size:
+            flush()
+            if chunk_overlap > 0 and chunks:
+                overlap_paragraphs = []
+                overlap_tokens = 0
+                for prev_p in reversed(chunks[-1].text.split("\n\n")):
+                    t = len(tokenizer.encode(prev_p))
+                    if overlap_tokens + t > chunk_overlap:
+                        break
+                    overlap_paragraphs.insert(0, prev_p)
+                    overlap_tokens += t
+                current_paragraphs = overlap_paragraphs
+                current_tokens = overlap_tokens
+
+        current_paragraphs.append(p)
+        current_tokens += p_tokens
+
+    flush()
+
+    if len(chunks) >= 2 and chunks[-1].token_count < min_chunk_size:
+        last = chunks.pop()
+        merged_text = chunks[-1].text + "\n\n" + last.text
+        chunks[-1] = Chunk(text=merged_text, token_count=chunks[-1].token_count + last.token_count)
+
+    return chunks
+
+
+# --- Quality filtering ---
+
+_URL_RE = re.compile(r"https?://\S+|www\.\S+")
+_DOI_RE = re.compile(r"\b10\.\d{4,9}/\S+")
+_CITATION_TOKEN_RE = re.compile(
+    r"\b(ibid\.?|op\.?\s*cit\.?|cf\.|et\s+al\.?|vol\.?\s*\d*|no\.?\s*\d+|"
+    r"pp?\.?\s*\d|chap(?:ter)?\.?\s*\d*|fig\.?\s*\d*|footnote|see also|doi:|isbn)\b",
+    re.IGNORECASE,
+)
+_PAGE_REF_RE = re.compile(r"\bp{1,2}\.?\s*\d{1,4}(?:[-–]\d{1,4})?\b", re.IGNORECASE)
+
+_VOWELS = set("aeiouAEIOU")
+_CONSONANT_RUN_RE = re.compile(r"[^aeiouAEIOU\s\d]{6,}")
+
+_ENGLISH_STOPWORDS = frozenset("""
+the a an and or but if of to in on for with as by at from is are was were
+be been being this that these those it its he she they we you i his her
+their our your not no do does did have has had will would can could should
+may might must than then so such which who whom what when where why how
+also into about between because after before while during each other some
+any all most more less much many one two first second new used using use
+between over under out up down near own such only just very both same
+""".split())
+
+_NON_LATIN_SCRIPT_RANGES = [
+    (0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0xF900, 0xFAFF),  # CJK
+    (0x3040, 0x30FF),  # Hiragana/Katakana
+    (0xAC00, 0xD7A3), (0x1100, 0x11FF),  # Hangul
+    (0x0600, 0x06FF), (0x0750, 0x077F),  # Arabic
+    (0x0590, 0x05FF),  # Hebrew
+    (0x0400, 0x04FF),  # Cyrillic
+    (0x0900, 0x097F),  # Devanagari
+    (0x0E00, 0x0E7F),  # Thai
+]
+
+_langdetect_ready = None
+
+
+@dataclass
+class QualityFilterResult:
+    text: str
+    stats: dict
+    examples: list = field(default_factory=list)
+
+
+def _non_latin_script_ratio(text: str) -> float:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return 0.0
+    hits = 0
+    for c in letters:
+        cp = ord(c)
+        for lo, hi in _NON_LATIN_SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                hits += 1
+                break
+    return hits / len(letters)
+
+
+def english_probability(text: str) -> float:
+    """0..1 confidence the paragraph is English. Cheap script check first
+    (catches CJK/Arabic/Cyrillic/etc. instantly), then langdetect for the
+    Latin-script case (catches e.g. French/German/Spanish)."""
+    global _langdetect_ready
+
+    stripped = text.strip()
+    if len(stripped) < 20:
+        return 1.0
+
+    if _non_latin_script_ratio(stripped) > 0.25:
+        return 0.0
+
+    if _langdetect_ready is False:
+        return 1.0
+
+    try:
+        from langdetect import DetectorFactory, detect_langs
+
+        DetectorFactory.seed = 0
+        _langdetect_ready = True
+        for lang in detect_langs(stripped):
+            if lang.lang == "en":
+                return lang.prob
+        return 0.05
+    except ImportError:
+        _langdetect_ready = False
+        return 1.0
+    except Exception:
+        return 0.5
+
+
+def _citation_density(paragraph: str) -> float:
+    words = paragraph.split()
+    if not words:
+        return 0.0
+    hits = (
+        len(_CITATION_TOKEN_RE.findall(paragraph))
+        + len(_PAGE_REF_RE.findall(paragraph))
+        + len(_DOI_RE.findall(paragraph))
+    )
+    return hits / len(words)
+
+
+def is_citation_fragment(paragraph: str) -> bool:
+    words = paragraph.split()
+    if not words:
+        return False
+    density = _citation_density(paragraph)
+    if len(words) <= 6 and density > 0:
+        return True
+    if density > 0.25 and len(words) <= 40:
+        return True
+    return False
+
+
+def _is_broken_word(word: str) -> bool:
+    w = re.sub(r"[^A-Za-z]", "", word)
+    if len(w) < 8:
+        return False
+    if not any(c in _VOWELS for c in w):
+        return True
+    if _CONSONANT_RUN_RE.search(w):
+        return True
+    if len(w) > 22:
+        return True
+    return False
+
+
+def _broken_word_ratio(text: str) -> float:
+    words = text.split()
+    if not words:
+        return 0.0
+    broken = sum(1 for w in words if _is_broken_word(w))
+    return broken / len(words)
+
+
+def compute_quality_score(paragraph: str, english_prob: float = None) -> tuple:
+    """Returns (score 0-100, breakdown dict). Higher is better."""
+    if english_prob is None:
+        english_prob = english_probability(paragraph)
+
+    words = paragraph.split()
+    n_words = max(len(words), 1)
+    n_chars = max(len(paragraph), 1)
+
+    alphabetic_ratio = sum(1 for c in paragraph if c.isalpha()) / n_chars
+
+    allowed_punct = set(".,;:!?'\"()-–—…$%/&")
+    unusual_char_ratio = sum(
+        1 for c in paragraph if not (c.isalnum() or c.isspace() or c in allowed_punct)
+    ) / n_chars
+
+    word_counts = Counter(w.lower() for w in words)
+    repeated_token_ratio = 1 - (len(word_counts) / n_words)
+
+    url_density = len(_URL_RE.findall(paragraph)) / n_words
+    citation_density = _citation_density(paragraph)
+    has_markup = contains_markup(paragraph)
+    punctuation_ratio = sum(1 for c in paragraph if c in ".,;:!?") / n_chars
+    broken_word_ratio = _broken_word_ratio(paragraph)
+
+    alpha_words = [re.sub(r"[^A-Za-z]", "", w) for w in words]
+    alpha_words = [w for w in alpha_words if w]
+    avg_word_len = sum(len(w) for w in alpha_words) / len(alpha_words) if alpha_words else 0.0
+    stopword_hits = sum(1 for w in alpha_words if w.lower() in _ENGLISH_STOPWORDS)
+    stopword_ratio = stopword_hits / len(alpha_words) if alpha_words else 0.0
+
+    score = 100.0
+    score -= (1 - english_prob) * 35
+    score -= max(0.0, 0.5 - alphabetic_ratio) * 100
+    score -= unusual_char_ratio * 120
+    score -= max(0.0, repeated_token_ratio - 0.4) * 80
+    score -= url_density * 150
+    score -= citation_density * 60
+    score -= 25 if has_markup else 0
+    score -= max(0.0, punctuation_ratio - 0.15) * 100
+    score -= broken_word_ratio * 100
+    score -= max(0.0, avg_word_len - 7.0) * 6.0
+    if len(alpha_words) >= 3 and stopword_ratio == 0.0:
+        score -= 25.0
+    if n_words == 1:
+        score -= 65.0
+    elif n_words == 2:
+        score -= 30.0
+    elif n_words <= 4:
+        score -= 12.0
+    score = max(0.0, min(100.0, score))
+
+    breakdown = {
+        "english_probability": round(english_prob, 3),
+        "alphabetic_ratio": round(alphabetic_ratio, 3),
+        "unusual_char_ratio": round(unusual_char_ratio, 3),
+        "repeated_token_ratio": round(repeated_token_ratio, 3),
+        "url_density": round(url_density, 3),
+        "citation_density": round(citation_density, 3),
+        "has_markup": has_markup,
+        "punctuation_ratio": round(punctuation_ratio, 3),
+        "broken_word_ratio": round(broken_word_ratio, 3),
+        "avg_word_len": round(avg_word_len, 2),
+        "stopword_ratio": round(stopword_ratio, 3),
+    }
+    return score, breakdown
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _normalize_for_hash(paragraph: str) -> str:
+    return re.sub(r"\s+", " ", paragraph.strip().lower())
+
+
+def _shingles(paragraph: str, k: int = 4) -> set:
+    words = _WORD_RE.findall(paragraph.lower())
+    if len(words) < k:
+        return {" ".join(words)} if words else set()
+    return {" ".join(words[i:i + k]) for i in range(len(words) - k + 1)}
+
+
+def _simhash(shingles: set, bits: int = 64) -> int:
+    if not shingles:
+        return 0
+    v = [0] * bits
+    for sh in shingles:
+        h = int(hashlib.blake2b(sh.encode("utf-8"), digest_size=8).hexdigest(), 16)
+        for i in range(bits):
+            v[i] += 1 if (h >> i) & 1 else -1
+    fingerprint = 0
+    for i in range(bits):
+        if v[i] > 0:
+            fingerprint |= (1 << i)
+    return fingerprint
+
+
+def _hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+def deduplicate_paragraphs(paragraphs: list, near_dup_hamming_threshold: int = 3) -> tuple:
+    """Returns (kept_paragraphs, exact_removed_count, near_removed_count)."""
+    seen_exact = set()
+    stage1 = []
+    exact_removed = 0
+    for p in paragraphs:
+        key = _normalize_for_hash(p)
+        if key in seen_exact:
+            exact_removed += 1
+            continue
+        seen_exact.add(key)
+        stage1.append(p)
+
+    fingerprints = [_simhash(_shingles(p)) for p in stage1]
+    is_dup = [False] * len(stage1)
+
+    band_bits = 16
+    for band_idx in range(64 // band_bits):
+        shift = band_idx * band_bits
+        mask = (1 << band_bits) - 1
+        buckets: dict = {}
+        for i, fp in enumerate(fingerprints):
+            if is_dup[i]:
+                continue
+            buckets.setdefault((fp >> shift) & mask, []).append(i)
+        for idxs in buckets.values():
+            if len(idxs) < 2:
+                continue
+            for a in range(len(idxs)):
+                if is_dup[idxs[a]]:
+                    continue
+                for b in range(a + 1, len(idxs)):
+                    j = idxs[b]
+                    if is_dup[j]:
+                        continue
+                    if _hamming(fingerprints[idxs[a]], fingerprints[j]) <= near_dup_hamming_threshold:
+                        is_dup[j] = True
+
+    kept = [p for i, p in enumerate(stage1) if not is_dup[i]]
+    near_removed = len(stage1) - len(kept)
+    return kept, exact_removed, near_removed
+
+
+def filter_and_score_text(
+    text: str,
+    *,
+    english_only: bool = True,
+    english_threshold: float = 0.55,
+    remove_citations: bool = True,
+    remove_low_quality: bool = True,
+    deduplicate: bool = True,
+    min_quality_score: float = 40.0,
+    max_unusual_char_ratio: float = 0.15,
+    max_examples: int = 60,
+) -> QualityFilterResult:
+    """Splits already-cleaned text into paragraphs, scores/filters each one,
+    deduplicates the survivors, and rejoins them. Never raises on empty input."""
+    original_chars = len(text)
+    paragraphs = split_paragraphs(text)
+    original_paragraph_count = len(paragraphs)
+
+    survivors = []
+    examples = []
+    removed_non_english = 0
+    removed_markup = 0
+    removed_citations = 0
+    removed_low_quality = 0
+
+    for p in paragraphs:
+        english_prob = english_probability(p) if english_only else 1.0
+        score, breakdown = compute_quality_score(p, english_prob)
+
+        keep = True
+        reason = "kept"
+
+        if breakdown["has_markup"]:
+            keep, reason = False, "markup"
+            removed_markup += 1
+        elif english_only and english_prob < english_threshold:
+            keep, reason = False, "non_english"
+            removed_non_english += 1
+        elif remove_citations and is_citation_fragment(p):
+            keep, reason = False, "citation_fragment"
+            removed_citations += 1
+        elif breakdown["unusual_char_ratio"] > max_unusual_char_ratio:
+            keep, reason = False, "unusual_characters"
+            removed_low_quality += 1
+        elif remove_low_quality and score < min_quality_score:
+            keep, reason = False, "low_quality"
+            removed_low_quality += 1
+
+        if keep:
+            survivors.append(p)
+        if len(examples) < max_examples:
+            examples.append({
+                "original": p,
+                "score": round(score, 1),
+                "keep": keep,
+                "reason": reason,
+            })
+
+    duplicates_removed = 0
+    if deduplicate and survivors:
+        survivors, exact_dup, near_dup = deduplicate_paragraphs(survivors)
+        duplicates_removed = exact_dup + near_dup
+
+    kept_text = "\n\n".join(survivors)
+
+    stats = {
+        "original_chars": original_chars,
+        "clean_chars": len(kept_text),
+        "original_paragraphs": original_paragraph_count,
+        "remaining_paragraphs": len(survivors),
+        "removed_paragraphs": original_paragraph_count - len(survivors),
+        "removed_non_english": removed_non_english,
+        "removed_markup": removed_markup,
+        "removed_citations": removed_citations,
+        "removed_low_quality": removed_low_quality,
+        "duplicates_removed": duplicates_removed,
+    }
+
+    return QualityFilterResult(text=kept_text, stats=stats, examples=examples)
+
+
+# --- Orchestration: source discovery -> extract -> clean -> filter -> chunk -> JSONL ---
+
+@dataclass
+class ProcessedDocument:
+    source_path: str
+    txt_path: str = None
+    page_count: int = 0
+    char_count: int = 0
+    word_count: int = 0
+    estimated_tokens: int = 0
+    warnings: list = field(default_factory=list)
+    cleaned_text: str = ""
+    quality_stats: dict = field(default_factory=dict)
+    quality_examples: list = field(default_factory=list)
+
+
+@dataclass
+class DatasetBuildResult:
+    jsonl_path: str
+    example_count: int
+    total_estimated_tokens: int
+    sample_examples: list
+    skipped_documents: list
+    quality_stats: dict = field(default_factory=dict)
+
+
+def discover_source_files(paths: list) -> list:
+    """Expand a mix of file paths and folder paths into a flat, de-duplicated
+    list of files with an extension registered in EXTRACTOR_REGISTRY."""
+    supported_exts = tuple(EXTRACTOR_REGISTRY.keys())
+    found = []
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isdir(p):
+            for root, _, files in os.walk(p):
+                for f in files:
+                    if f.lower().endswith(supported_exts):
+                        found.append(os.path.join(root, f))
+        elif os.path.isfile(p):
+            if p.lower().endswith(supported_exts):
+                found.append(p)
+            else:
+                raise ValueError(
+                    f"Unsupported file type for dataset prep: '{p}' (supported: {sorted(supported_exts)})"
+                )
+        else:
+            raise FileNotFoundError(f"Path not found: {p}")
+
+    deduped = sorted(set(os.path.abspath(f) for f in found))
+    if not deduped:
+        raise ValueError(f"No supported files found in the given selection (supported: {sorted(supported_exts)}).")
+    return deduped
+
+
+def process_document(
+    file_path: str,
+    txt_output_dir: str,
+    remove_headers_footers: bool = True,
+    remove_page_numbers: bool = True,
+    normalize_unicode: bool = True,
+    remove_markup: bool = True,
+    remove_web_artifacts: bool = True,
+    english_only: bool = True,
+    english_threshold: float = 0.55,
+    remove_citations: bool = True,
+    remove_low_quality: bool = True,
+    deduplicate: bool = True,
+    min_quality_score: float = 40.0,
+    max_unusual_char_ratio: float = 0.15,
+) -> ProcessedDocument:
+    extractor = get_extractor_for(file_path)
+    extraction = extractor.extract(file_path)
+    cleaning = clean_extraction(
+        extraction,
+        remove_headers_footers=remove_headers_footers,
+        remove_page_numbers=remove_page_numbers,
+        normalize_unicode=normalize_unicode,
+        remove_markup=remove_markup,
+        remove_web_artifacts=remove_web_artifacts,
+    )
+
+    warnings = list(cleaning.warnings)
+
+    quality = filter_and_score_text(
+        cleaning.text,
+        english_only=english_only,
+        english_threshold=english_threshold,
+        remove_citations=remove_citations,
+        remove_low_quality=remove_low_quality,
+        deduplicate=deduplicate,
+        min_quality_score=min_quality_score,
+        max_unusual_char_ratio=max_unusual_char_ratio,
+    )
+    cleaned_text = quality.text
+
+    if quality.stats["removed_paragraphs"] > 0:
+        warnings.append(
+            f"Quality filter removed {quality.stats['removed_paragraphs']} of "
+            f"{quality.stats['original_paragraphs']} paragraph(s) "
+            f"(non-English: {quality.stats['removed_non_english']}, "
+            f"markup: {quality.stats['removed_markup']}, "
+            f"citations: {quality.stats['removed_citations']}, "
+            f"low quality: {quality.stats['removed_low_quality']}, "
+            f"duplicates: {quality.stats['duplicates_removed']})."
+        )
+
+    txt_path = None
+    if cleaned_text.strip():
+        os.makedirs(txt_output_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        txt_path = os.path.join(txt_output_dir, f"{base_name}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_text)
+
+    tokenizer = get_tokenizer()
+    estimated_tokens = len(tokenizer.encode(cleaned_text)) if cleaned_text.strip() else 0
+
+    return ProcessedDocument(
+        source_path=file_path,
+        txt_path=txt_path,
+        page_count=extraction.page_count,
+        char_count=len(cleaned_text),
+        word_count=len(cleaned_text.split()),
+        estimated_tokens=estimated_tokens,
+        warnings=warnings,
+        cleaned_text=cleaned_text,
+        quality_stats=quality.stats,
+        quality_examples=quality.examples,
+    )
+
+
+def process_sources(paths: list, txt_output_dir: str, **cleaning_opts):
+    """Returns (documents, errors) — errors are per-file failures that didn't stop the batch."""
+    file_paths = discover_source_files(paths)
+    documents = []
+    errors = []
+
+    for fp in file_paths:
+        try:
+            documents.append(process_document(fp, txt_output_dir, **cleaning_opts))
+        except Exception as e:
+            errors.append(f"{os.path.basename(fp)}: {e}")
+
+    if not documents:
+        detail = "\n".join(errors) if errors else "unknown error"
+        raise RuntimeError(f"No documents could be processed.\n{detail}")
+
+    return documents, errors
+
+
+def build_jsonl_dataset(
+    documents: list,
+    jsonl_output_dir: str,
+    dataset_filename: str,
+    chunk_size: int = 512,
+    chunk_overlap: int = 50,
+    min_chunk_size: int = 64,
+    sample_count: int = 5,
+) -> DatasetBuildResult:
+    if not documents:
+        raise ValueError("No processed documents were provided to build a dataset from.")
+
+    dataset_filename = (dataset_filename or "").strip()
+    if not dataset_filename:
+        raise ValueError("Dataset filename cannot be empty.")
+    if not dataset_filename.lower().endswith(".jsonl"):
+        dataset_filename += ".jsonl"
+
+    os.makedirs(jsonl_output_dir, exist_ok=True)
+    jsonl_path = os.path.join(jsonl_output_dir, dataset_filename)
+
+    tokenizer = get_tokenizer()
+    skipped = []
+    all_examples = []
+
+    for doc in documents:
+        if not doc.cleaned_text.strip():
+            skipped.append(os.path.basename(doc.source_path))
+            continue
+        chunks = chunk_text(
+            doc.cleaned_text,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_size=min_chunk_size,
+            tokenizer=tokenizer,
+        )
+        all_examples.extend(c.text.strip() for c in chunks if c.text.strip())
+
+    if not all_examples:
+        raise RuntimeError(
+            "Chunking produced zero examples — refusing to write an empty dataset. "
+            "Check that the source files contain extractable text and that chunk settings are reasonable."
+        )
+
+    total_tokens = 0
+    tmp_path = jsonl_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for text in all_examples:
+                line = json.dumps({"text": text}, ensure_ascii=False)
+                json.loads(line)
+                f.write(line + "\n")
+                total_tokens += len(tokenizer.encode(text))
+    except Exception:
+        if os.path.isfile(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+    os.replace(tmp_path, jsonl_path)
+
+    quality_stats = {}
+    for doc in documents:
+        for key, value in doc.quality_stats.items():
+            quality_stats[key] = quality_stats.get(key, 0) + value
+
+    return DatasetBuildResult(
+        jsonl_path=jsonl_path,
+        example_count=len(all_examples),
+        total_estimated_tokens=total_tokens,
+        sample_examples=all_examples[:sample_count],
+        skipped_documents=skipped,
+        quality_stats=quality_stats,
+    )
+
+
+# ============================================================================
 # Dataset loading — plain .txt / .jsonl, plus optional HF Hub download
 # ============================================================================
 
@@ -402,6 +1486,32 @@ def load_and_tokenize(file_paths) -> torch.Tensor:
     return torch.tensor(token_ids, dtype=torch.long)
 
 
+# Popular, known-good text-pretraining datasets on the Hub, offered as a
+# one-click preset in the UI instead of typing repo id/config/split/column
+# from memory. "Custom..." leaves the fields as free text.
+DATASET_PRESETS = {
+    "Custom...": {},
+    "TinyStories (roneneldan/TinyStories)": {
+        "repo_id": "roneneldan/TinyStories", "config_name": "", "split": "train", "text_field": "text",
+    },
+    "WikiText-103 raw (wikitext)": {
+        "repo_id": "wikitext", "config_name": "wikitext-103-raw-v1", "split": "train", "text_field": "text",
+    },
+    "OpenWebText (Skylion007/openwebtext)": {
+        "repo_id": "Skylion007/openwebtext", "config_name": "", "split": "train", "text_field": "text",
+    },
+    "BookCorpus (bookcorpus)": {
+        "repo_id": "bookcorpus", "config_name": "", "split": "train", "text_field": "text",
+    },
+    "C4 English, streamed subset (allenai/c4)": {
+        "repo_id": "allenai/c4", "config_name": "en", "split": "train", "text_field": "text",
+    },
+    "Wikipedia English (wikimedia/wikipedia)": {
+        "repo_id": "wikimedia/wikipedia", "config_name": "20231101.en", "split": "train", "text_field": "text",
+    },
+}
+
+
 def download_hf_dataset(
     repo_id: str,
     config_name: str = None,
@@ -411,10 +1521,24 @@ def download_hf_dataset(
     jsonl_output_dir: str = "datasets",
     dataset_filename: str = None,
     chunk_size: int = 512,
+    chunk_overlap: int = 50,
+    min_chunk_size: int = 64,
+    normalize_unicode: bool = True,
+    remove_markup: bool = True,
+    remove_web_artifacts: bool = True,
+    english_only: bool = True,
+    english_threshold: float = 0.55,
+    remove_citations: bool = True,
+    remove_low_quality: bool = True,
+    deduplicate: bool = True,
+    min_quality_score: float = 40.0,
+    max_unusual_char_ratio: float = 0.15,
 ) -> dict:
-    """Downloads a dataset from the Hugging Face Hub and writes it out as local
-    JSONL ({"text": ...} per line), chunked to roughly `chunk_size` tokens.
-    No OCR/quality-filtering pipeline here — see the module docstring."""
+    """Downloads a dataset from the Hugging Face Hub, runs it through the SAME
+    cleaning -> quality filtering -> deduplication -> chunking pipeline used
+    for local PDF/image/text sources, and writes it out as local JSONL in the
+    same {"text": ...} format. Never silently writes an empty or corrupted
+    file — raises instead."""
     repo_id = (repo_id or "").strip()
     if not repo_id:
         raise ValueError("Hugging Face dataset repo id cannot be empty (e.g. 'roneneldan/TinyStories').")
@@ -426,7 +1550,7 @@ def download_hf_dataset(
     try:
         from datasets import load_dataset
     except ImportError as e:
-        raise RuntimeError("The 'datasets' library is required: pip install datasets") from e
+        raise RuntimeError("The 'datasets' library is required. Install it with: pip install datasets") from e
 
     try:
         hf_dataset = load_dataset(repo_id, config_name, split=split)
@@ -442,53 +1566,84 @@ def download_hf_dataset(
     if not dataset_filename.lower().endswith(".jsonl"):
         dataset_filename += ".jsonl"
 
-    tokenizer = get_tokenizer()
-    os.makedirs(jsonl_output_dir, exist_ok=True)
-    jsonl_path = os.path.join(jsonl_output_dir, dataset_filename)
-
-    examples = []
-    buffer_tokens = []
+    raw_rows = []
     for i, row in enumerate(hf_dataset):
         if max_examples and i >= max_examples:
             break
         text = row.get(text_field)
-        if not text or not str(text).strip():
-            continue
-        buffer_tokens.extend(tokenizer.encode(str(text).strip() + "\n"))
-        while len(buffer_tokens) >= chunk_size:
-            piece = buffer_tokens[:chunk_size]
-            buffer_tokens = buffer_tokens[chunk_size:]
-            examples.append(tokenizer.decode(piece))
-    if buffer_tokens:
-        examples.append(tokenizer.decode(buffer_tokens))
+        if text and str(text).strip():
+            raw_rows.append(str(text).strip())
 
-    if not examples:
+    if not raw_rows:
         raise RuntimeError(
             f"No usable examples found in '{repo_id}' (split='{split}', column='{text_field}') — "
             "refusing to write an empty dataset."
         )
 
-    total_tokens = 0
-    tmp_path = jsonl_path + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for text in examples:
-                line = json.dumps({"text": text}, ensure_ascii=False)
-                json.loads(line)
-                f.write(line + "\n")
-                total_tokens += len(tokenizer.encode(text))
-    except Exception:
-        if os.path.isfile(tmp_path):
-            os.remove(tmp_path)
-        raise
-    os.replace(tmp_path, jsonl_path)
+    # Each HF row is treated as its own paragraph boundary, then run through
+    # the exact same clean_extraction + filter_and_score_text pipeline that
+    # PDF/image/text sources go through (single synthetic "page").
+    combined_raw_text = "\n\n".join(raw_rows)
+    synthetic_extraction = ExtractionResult(
+        source_path=repo_id,
+        page_count=1,
+        pages=[ExtractedPage(index=0, text=combined_raw_text)],
+        raw_text=combined_raw_text,
+    )
+    cleaning = clean_extraction(
+        synthetic_extraction,
+        remove_headers_footers=False,
+        remove_page_numbers=False,
+        normalize_unicode=normalize_unicode,
+        remove_markup=remove_markup,
+        remove_web_artifacts=remove_web_artifacts,
+    )
+    quality = filter_and_score_text(
+        cleaning.text,
+        english_only=english_only,
+        english_threshold=english_threshold,
+        remove_citations=remove_citations,
+        remove_low_quality=remove_low_quality,
+        deduplicate=deduplicate,
+        min_quality_score=min_quality_score,
+        max_unusual_char_ratio=max_unusual_char_ratio,
+    )
+
+    if not quality.text.strip():
+        raise RuntimeError(
+            f"Cleaning/quality filtering removed all text from '{repo_id}' — "
+            "refusing to write an empty dataset. Try relaxing the quality controls."
+        )
+
+    tokenizer = get_tokenizer()
+    doc = ProcessedDocument(
+        source_path=repo_id,
+        char_count=len(quality.text),
+        word_count=len(quality.text.split()),
+        estimated_tokens=len(tokenizer.encode(quality.text)),
+        cleaned_text=quality.text,
+        quality_stats=quality.stats,
+        quality_examples=quality.examples,
+    )
+
+    result = build_jsonl_dataset(
+        [doc],
+        jsonl_output_dir=jsonl_output_dir,
+        dataset_filename=dataset_filename,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        min_chunk_size=min_chunk_size,
+    )
 
     return {
-        "jsonl_path": jsonl_path,
-        "example_count": len(examples),
-        "total_estimated_tokens": total_tokens,
+        "jsonl_path": result.jsonl_path,
+        "example_count": result.example_count,
+        "total_chars": len(quality.text),
+        "total_estimated_tokens": result.total_estimated_tokens,
         "columns": hf_dataset.column_names,
-        "sample_examples": examples[:5],
+        "sample_examples": result.sample_examples,
+        "quality_stats": quality.stats,
+        "quality_examples": quality.examples,
     }
 
 
@@ -859,7 +2014,41 @@ def refresh_existing_datasets(scan_dir):
     return gr.update(choices=choices, value=[])
 
 
-def run_download_hf_dataset(repo_id, config_name, split, text_field, max_examples, jsonl_out_dir, dataset_filename, chunk_size):
+def on_select_dataset_preset(preset_name):
+    """Autofills the repo id / config / split / text-field boxes from DATASET_PRESETS."""
+    preset = DATASET_PRESETS.get(preset_name) or {}
+    return (
+        gr.update(value=preset.get("repo_id", "")),
+        gr.update(value=preset.get("config_name", "")),
+        gr.update(value=preset.get("split", "train")),
+        gr.update(value=preset.get("text_field", "text")),
+    )
+
+
+def _format_quality_stats(stats: dict) -> str:
+    if not stats:
+        return ""
+    return (
+        f"Original characters: {stats.get('original_chars', 0):,}\n"
+        f"Clean characters: {stats.get('clean_chars', 0):,}\n"
+        f"Original paragraphs: {stats.get('original_paragraphs', 0)}\n"
+        f"Remaining paragraphs: {stats.get('remaining_paragraphs', 0)}\n"
+        f"Removed paragraphs: {stats.get('removed_paragraphs', 0)}\n"
+        f"Removed as non-English: {stats.get('removed_non_english', 0)}\n"
+        f"Removed as markup: {stats.get('removed_markup', 0)}\n"
+        f"Removed as citation/reference fragments: {stats.get('removed_citations', 0)}\n"
+        f"Removed as low quality: {stats.get('removed_low_quality', 0)}\n"
+        f"Duplicates removed: {stats.get('duplicates_removed', 0)}"
+    )
+
+
+def run_download_hf_dataset(
+    repo_id, config_name, split, text_field, max_examples, jsonl_out_dir, dataset_filename,
+    chunk_size, chunk_overlap, min_chunk_size,
+    remove_markup, remove_web_artifacts, english_only, english_threshold,
+    remove_citations, remove_low_quality, deduplicate, min_quality_score,
+    max_unusual_char_ratio,
+):
     try:
         result = download_hf_dataset(
             repo_id=repo_id,
@@ -870,19 +2059,165 @@ def run_download_hf_dataset(repo_id, config_name, split, text_field, max_example
             jsonl_output_dir=(jsonl_out_dir or "datasets").strip() or "datasets",
             dataset_filename=dataset_filename,
             chunk_size=int(chunk_size),
+            chunk_overlap=int(chunk_overlap),
+            min_chunk_size=int(min_chunk_size),
+            remove_markup=remove_markup,
+            remove_web_artifacts=remove_web_artifacts,
+            english_only=english_only,
+            english_threshold=float(english_threshold),
+            remove_citations=remove_citations,
+            remove_low_quality=remove_low_quality,
+            deduplicate=deduplicate,
+            min_quality_score=float(min_quality_score),
+            max_unusual_char_ratio=float(max_unusual_char_ratio),
         )
     except Exception as e:
         return f"Download failed: {e}", ""
 
     status = (
         f"Downloaded '{repo_id}' -> {result['jsonl_path']}\n"
-        f"JSONL examples: {result['example_count']}\n"
+        f"JSONL examples (after cleaning/filtering/chunking): {result['example_count']}\n"
         f"Estimated total tokens: {result['total_estimated_tokens']}\n"
-        f"Available columns: {', '.join(result['columns'])}"
+        f"Clean characters kept: {result['total_chars']:,}\n"
+        f"Available columns: {', '.join(result['columns'])}\n\n"
+        f"--- Quality filtering ---\n"
+        f"{_format_quality_stats(result['quality_stats'])}"
     )
     sample_display = "\n\n---\n\n".join(
         json.dumps({"text": s}, ensure_ascii=False) for s in result["sample_examples"]
     )
+    return status, sample_display
+
+
+def _format_quality_examples(examples: list, limit: int = 15) -> str:
+    if not examples:
+        return "(no paragraphs to show)"
+    blocks = []
+    for ex in examples[:limit]:
+        status = "KEEP" if ex["keep"] else f"REMOVE ({ex['reason']})"
+        original = ex["original"][:400]
+        blocks.append(f"[{status}] quality score={ex['score']}\n{original}")
+    return "\n\n---\n\n".join(blocks)
+
+
+PREVIEW_CHAR_LIMIT = 5000
+
+
+def _doc_preview(doc):
+    stats = (
+        f"Pages: {doc.page_count}\n"
+        f"Characters: {doc.char_count}\n"
+        f"Words: {doc.word_count}\n"
+        f"Estimated tokens: {doc.estimated_tokens}\n"
+        f"Warnings: {'; '.join(doc.warnings) if doc.warnings else 'none'}\n"
+        f"TXT saved to: {doc.txt_path or '(not saved — no extractable text found)'}\n\n"
+        f"--- Quality filtering ---\n"
+        f"{_format_quality_stats(doc.quality_stats)}"
+    )
+    preview_text = doc.cleaned_text[:PREVIEW_CHAR_LIMIT]
+    if len(doc.cleaned_text) > PREVIEW_CHAR_LIMIT:
+        preview_text += "\n\n... (preview truncated, full text saved to the .txt file)"
+    quality_examples = _format_quality_examples(doc.quality_examples)
+    return preview_text, stats, quality_examples
+
+
+def run_extract_and_clean(
+    files_multi, files_dir, remove_hf, remove_pn, norm_unicode, txt_out_dir,
+    remove_markup, remove_web_artifacts, english_only, english_threshold,
+    remove_citations, remove_low_quality, deduplicate, min_quality_score,
+    max_unusual_char_ratio,
+):
+    paths = list(files_multi or []) + list(files_dir or [])
+
+    if not paths:
+        return [], gr.update(choices=[], value=None), "Please upload at least one PDF/image/text file or a folder of them.", "", "", ""
+
+    try:
+        documents, errors = process_sources(
+            paths,
+            txt_output_dir=(txt_out_dir or "cleaned").strip() or "cleaned",
+            remove_headers_footers=remove_hf,
+            remove_page_numbers=remove_pn,
+            normalize_unicode=norm_unicode,
+            remove_markup=remove_markup,
+            remove_web_artifacts=remove_web_artifacts,
+            english_only=english_only,
+            english_threshold=float(english_threshold),
+            remove_citations=remove_citations,
+            remove_low_quality=remove_low_quality,
+            deduplicate=deduplicate,
+            min_quality_score=float(min_quality_score),
+            max_unusual_char_ratio=float(max_unusual_char_ratio),
+        )
+    except Exception as e:
+        return [], gr.update(choices=[], value=None), f"Extraction failed: {e}", "", "", ""
+
+    lines = [f"Processed {len(documents)} of {len(documents) + len(errors)} file(s):"]
+    for doc in documents:
+        name = os.path.basename(doc.source_path)
+        status = "OK" if doc.txt_path else "NO EXTRACTABLE TEXT"
+        lines.append(
+            f"  - {name}: {status} | pages={doc.page_count} chars={doc.char_count} "
+            f"words={doc.word_count} est_tokens={doc.estimated_tokens}"
+        )
+        for w in doc.warnings:
+            lines.append(f"      warning: {w}")
+
+    if errors:
+        lines.append("\nFiles that failed to process:")
+        for err in errors:
+            lines.append(f"  - {err}")
+
+    choices = [os.path.basename(d.source_path) for d in documents]
+    preview_text, stats, quality_examples = _doc_preview(documents[0]) if documents else ("", "", "")
+
+    return (
+        documents,
+        gr.update(choices=choices, value=choices[0] if choices else None),
+        "\n".join(lines),
+        preview_text,
+        stats,
+        quality_examples,
+    )
+
+
+def on_select_preview_doc(selected_name, documents):
+    for doc in (documents or []):
+        if os.path.basename(doc.source_path) == selected_name:
+            return _doc_preview(doc)
+    return "", "", ""
+
+
+def run_build_dataset(documents, chunk_size, chunk_overlap, min_chunk_size, jsonl_out_dir, dataset_filename):
+    if not documents:
+        return "No processed documents available. Run 'Extract & Clean' first.", ""
+
+    try:
+        result = build_jsonl_dataset(
+            documents,
+            jsonl_output_dir=(jsonl_out_dir or "datasets").strip() or "datasets",
+            dataset_filename=(dataset_filename or "dataset.jsonl").strip() or "dataset.jsonl",
+            chunk_size=int(chunk_size),
+            chunk_overlap=int(chunk_overlap),
+            min_chunk_size=int(min_chunk_size),
+        )
+    except Exception as e:
+        return f"Dataset build failed: {e}", ""
+
+    status = (
+        f"Dataset written to: {result.jsonl_path}\n"
+        f"Examples: {result.example_count}\n"
+        f"Estimated total tokens: {result.total_estimated_tokens}"
+    )
+    if result.skipped_documents:
+        status += f"\nSkipped (no usable text): {', '.join(result.skipped_documents)}"
+    if result.quality_stats:
+        status += f"\n\n--- Quality filtering (aggregated across documents) ---\n{_format_quality_stats(result.quality_stats)}"
+
+    sample_display = "\n\n---\n\n".join(
+        json.dumps({"text": s}, ensure_ascii=False) for s in result.sample_examples
+    )
+
     return status, sample_display
 
 
@@ -1113,6 +2448,102 @@ with gr.Blocks(title="TechcodeX") as demo:
     gr.Markdown(f"**Device:** `{device}` (`{_DEVICE_KIND}`){' — running in Colab' if _IN_COLAB else ''}")
 
     with gr.Tabs():
+        with gr.Tab("Tab 0: Dataset Preparation (PDF/Image/Text → JSONL)"):
+            processed_docs_state = gr.State([])
+
+            gr.Markdown("### 1. Import PDFs / Images / Text")
+            with gr.Row():
+                pdf_files = gr.File(
+                    label="Upload PDF, image (PNG/JPG), or .txt file(s)",
+                    file_count="multiple",
+                    file_types=[".pdf", ".png", ".jpg", ".jpeg", ".txt"],
+                )
+                pdf_folder = gr.File(
+                    label="Or select an entire folder of PDFs/images/text",
+                    file_count="directory",
+                )
+            gr.Markdown(
+                "*Images are processed with OCR (Tesseract) since they have no native text layer — "
+                "requires the Tesseract OCR engine installed separately (`!apt-get install -y "
+                "tesseract-ocr` on Colab, or see setup_env.ps1 on Windows). `.txt` files skip OCR "
+                "but still run through the same cleaning pass.*"
+            )
+
+            gr.Markdown("### 2. Cleaning options")
+            with gr.Row():
+                remove_hf_checkbox = gr.Checkbox(value=True, label="Remove repeated headers/footers")
+                remove_pn_checkbox = gr.Checkbox(value=True, label="Remove standalone page numbers")
+                norm_unicode_checkbox = gr.Checkbox(value=True, label="Normalize Unicode")
+
+            gr.Markdown(
+                "### 2b. Quality filtering\n"
+                "Catches garbage — markup, web boilerplate, citation-only fragments, "
+                "corrupted extraction text, non-English text, and duplicates — before it "
+                "reaches chunking/tokenization."
+            )
+            with gr.Row():
+                english_only_checkbox = gr.Checkbox(value=True, label="English Only")
+                remove_markup_checkbox = gr.Checkbox(value=True, label="Remove HTML/SVG/XML")
+                remove_web_artifacts_checkbox = gr.Checkbox(value=True, label="Remove obvious web artifacts")
+                remove_citations_checkbox = gr.Checkbox(value=True, label="Remove citation/reference-only fragments")
+            with gr.Row():
+                remove_low_quality_checkbox = gr.Checkbox(value=True, label="Remove corrupted/low-quality text")
+                deduplicate_checkbox = gr.Checkbox(value=True, label="Deduplicate")
+            with gr.Row():
+                english_threshold_slider = gr.Slider(0.0, 1.0, value=0.55, step=0.05, label="English confidence threshold")
+                min_quality_score_slider = gr.Slider(0, 100, value=40, step=1, label="Minimum quality score")
+                max_unusual_char_ratio_slider = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="Maximum unusual-character ratio")
+
+            txt_out_dir_box = gr.Textbox(value="cleaned", label="TXT Output Directory")
+            extract_button = gr.Button("Extract & Clean", variant="primary")
+            extract_status = gr.Textbox(label="Extraction Log", interactive=False, lines=8)
+
+            gr.Markdown("### 3. Preview extracted text")
+            with gr.Row():
+                with gr.Column(scale=1):
+                    doc_selector = gr.Dropdown(label="Processed file", choices=[], interactive=True)
+                    doc_stats = gr.Textbox(label="Statistics", interactive=False, lines=15)
+                with gr.Column(scale=2):
+                    doc_preview = gr.Textbox(label="Cleaned Text Preview (surviving text)", interactive=False, lines=12)
+                    quality_examples_display = gr.Textbox(
+                        label="Per-paragraph quality decisions (Original / Score / Keep-Remove)",
+                        interactive=False, lines=16,
+                    )
+
+            gr.Markdown("### 4. Chunking & JSONL export")
+            with gr.Row():
+                chunk_size_slider = gr.Slider(32, 2048, value=1024, step=16, label="Chunk Size (tokens)")
+                chunk_overlap_slider = gr.Slider(0, 256, value=50, step=8, label="Chunk Overlap (tokens)")
+                min_chunk_size_slider = gr.Slider(0, 256, value=64, step=8, label="Minimum Chunk Size (tokens)")
+            with gr.Row():
+                jsonl_out_dir_box = gr.Textbox(value="datasets", label="JSONL Output Directory")
+                dataset_filename_box = gr.Textbox(value="dataset.jsonl", label="Dataset Filename")
+
+            build_dataset_button = gr.Button("Build JSONL Dataset", variant="primary")
+            dataset_status = gr.Textbox(label="Dataset Build Log", interactive=False, lines=5)
+            dataset_sample = gr.Textbox(label="Sample JSONL Examples", interactive=False, lines=10)
+
+            extract_button.click(
+                fn=run_extract_and_clean,
+                inputs=[
+                    pdf_files, pdf_folder, remove_hf_checkbox, remove_pn_checkbox, norm_unicode_checkbox, txt_out_dir_box,
+                    remove_markup_checkbox, remove_web_artifacts_checkbox, english_only_checkbox, english_threshold_slider,
+                    remove_citations_checkbox, remove_low_quality_checkbox, deduplicate_checkbox,
+                    min_quality_score_slider, max_unusual_char_ratio_slider,
+                ],
+                outputs=[processed_docs_state, doc_selector, extract_status, doc_preview, doc_stats, quality_examples_display],
+            )
+            doc_selector.change(
+                fn=on_select_preview_doc,
+                inputs=[doc_selector, processed_docs_state],
+                outputs=[doc_preview, doc_stats, quality_examples_display],
+            )
+            build_dataset_button.click(
+                fn=run_build_dataset,
+                inputs=[processed_docs_state, chunk_size_slider, chunk_overlap_slider, min_chunk_size_slider, jsonl_out_dir_box, dataset_filename_box],
+                outputs=[dataset_status, dataset_sample],
+            )
+
         with gr.Tab("Tab 1: Dataset & Training Configuration"):
             with gr.Row():
                 with gr.Column(scale=1):
@@ -1131,6 +2562,11 @@ with gr.Blocks(title="TechcodeX") as demo:
                     )
 
                     gr.Markdown("**Or download a dataset from the Hugging Face Hub:**")
+                    hf_preset_dropdown = gr.Dropdown(
+                        choices=list(DATASET_PRESETS.keys()),
+                        value="Custom...",
+                        label="Preset dataset (pick one, or leave as Custom... and fill in below)",
+                    )
                     with gr.Row():
                         hf_repo_id_box = gr.Textbox(label="Dataset repo id", placeholder="e.g. roneneldan/TinyStories")
                         hf_config_box = gr.Textbox(label="Config name (optional)")
@@ -1140,10 +2576,30 @@ with gr.Blocks(title="TechcodeX") as demo:
                         hf_max_examples_box = gr.Number(value=5000, label="Max examples (0 = all)", precision=0)
                         hf_jsonl_out_dir_box = gr.Textbox(value="datasets", label="Output dir")
                         hf_dataset_filename_box = gr.Textbox(label="Filename (optional)")
+                    with gr.Row():
                         hf_chunk_size_box = gr.Number(value=1024, label="Chunk size (tokens)", precision=0)
+                        hf_chunk_overlap_box = gr.Number(value=50, label="Chunk overlap (tokens)", precision=0)
+                        hf_min_chunk_size_box = gr.Number(value=64, label="Min chunk size (tokens)", precision=0)
+                    with gr.Row():
+                        hf_english_only_checkbox = gr.Checkbox(value=True, label="English Only")
+                        hf_remove_markup_checkbox = gr.Checkbox(value=True, label="Remove HTML/SVG/XML")
+                        hf_remove_web_artifacts_checkbox = gr.Checkbox(value=True, label="Remove web artifacts")
+                        hf_remove_citations_checkbox = gr.Checkbox(value=True, label="Remove citation fragments")
+                        hf_remove_low_quality_checkbox = gr.Checkbox(value=True, label="Remove low-quality text")
+                        hf_deduplicate_checkbox = gr.Checkbox(value=True, label="Deduplicate")
+                    with gr.Row():
+                        hf_english_threshold_slider = gr.Slider(0.0, 1.0, value=0.55, step=0.05, label="English confidence threshold")
+                        hf_min_quality_score_slider = gr.Slider(0, 100, value=40, step=1, label="Minimum quality score")
+                        hf_max_unusual_char_ratio_slider = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="Max unusual-character ratio")
                     hf_download_button = gr.Button("Download Dataset from Hugging Face", variant="secondary")
-                    hf_download_status = gr.Textbox(label="Download Log", interactive=False, lines=4)
+                    hf_download_status = gr.Textbox(label="Download Log", interactive=False, lines=6)
                     hf_download_sample = gr.Textbox(label="Sample JSONL Examples", interactive=False, lines=6)
+
+                    hf_preset_dropdown.change(
+                        fn=on_select_dataset_preset,
+                        inputs=hf_preset_dropdown,
+                        outputs=[hf_repo_id_box, hf_config_box, hf_split_box, hf_text_field_box],
+                    )
 
                     gr.Markdown("---")
                     batch_size_slider = gr.Slider(1, 64, value=4, step=1, label="Batch Size")
@@ -1191,7 +2647,12 @@ with gr.Blocks(title="TechcodeX") as demo:
                 fn=run_download_hf_dataset,
                 inputs=[
                     hf_repo_id_box, hf_config_box, hf_split_box, hf_text_field_box,
-                    hf_max_examples_box, hf_jsonl_out_dir_box, hf_dataset_filename_box, hf_chunk_size_box,
+                    hf_max_examples_box, hf_jsonl_out_dir_box, hf_dataset_filename_box,
+                    hf_chunk_size_box, hf_chunk_overlap_box, hf_min_chunk_size_box,
+                    hf_remove_markup_checkbox, hf_remove_web_artifacts_checkbox,
+                    hf_english_only_checkbox, hf_english_threshold_slider,
+                    hf_remove_citations_checkbox, hf_remove_low_quality_checkbox, hf_deduplicate_checkbox,
+                    hf_min_quality_score_slider, hf_max_unusual_char_ratio_slider,
                 ],
                 outputs=[hf_download_status, hf_download_sample],
             )
