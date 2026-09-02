@@ -7,7 +7,12 @@ be pasted straight into a Google Colab cell (with a TPU runtime) or run
 locally on Windows (CUDA / AMD DirectML / CPU).
 
 Colab TPU quick start (in a notebook cell, before this file's code):
-    !pip install -q torch~=2.4 torch_xla[tpu]~=2.4 -f https://storage.googleapis.com/libtpu-releases/index.html
+    # Do NOT pin torch to a specific version here — torch_xla's compiled C
+    # extension (_XLAC.so) is built against one exact torch build, and
+    # pinning torch separately (e.g. torch~=2.4) can pull a mismatched
+    # version, causing "undefined symbol" ImportErrors. Let pip resolve
+    # torch from torch_xla's own dependency instead.
+    !pip install -q "torch_xla[tpu]" -f https://storage.googleapis.com/libtpu-releases/index.html
     !pip install -q transformers datasets gradio huggingface_hub
 
 Local Windows quick start:
