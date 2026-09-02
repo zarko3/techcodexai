@@ -71,7 +71,12 @@ except ImportError:
 
 print(f"TechcodeX device: {device} (kind={_DEVICE_KIND})")
 
-_IN_COLAB = "google.colab" in sys.modules
+
+# sys.modules only has 'google.colab' injected when code runs inside Colab's
+# own IPython kernel (e.g. a notebook cell, or %run) — a `!python file.py`
+# subprocess doesn't inherit it. Colab does set these env vars for every
+# subprocess it spawns, so check those instead.
+_IN_COLAB = any(k in os.environ for k in ("COLAB_RELEASE_TAG", "COLAB_JUPYTER_TRANSPORT", "COLAB_GPU"))
 
 
 def _optimizer_step(optimizer):
