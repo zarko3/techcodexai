@@ -103,10 +103,16 @@ def _optimizer_step(optimizer):
 
 
 def _save_checkpoint(obj: dict, path: str):
+    """Writes to a temp file and renames it into place, so a crash/OOM/session
+    drop mid-write leaves the previous good checkpoint intact instead of a
+    truncated, unreadable .pt file — os.replace is atomic on both Windows and
+    Linux, unlike writing directly to `path`."""
+    tmp_path = path + ".tmp"
     if _DEVICE_KIND == "xla":
-        _XLA.save(obj, path)
+        _XLA.save(obj, tmp_path)
     else:
-        torch.save(obj, path)
+        torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path: str, map_location="cpu") -> dict:
@@ -121,8 +127,21 @@ def load_checkpoint(path: str, map_location="cpu") -> dict:
     """
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
-    except Exception:
-        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    except Exception as first_error:
+        try:
+            checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+        except Exception:
+            # Both the safe and legacy load paths failed the same way — this
+            # isn't the weights_only compatibility case the fallback exists
+            # for, the file itself is unreadable (most often: a save that got
+            # interrupted mid-write by a crash/OOM/session drop, leaving a
+            # truncated .pt). Nothing to recover here; a re-save can't fix a
+            # torch.save that never finished.
+            raise RuntimeError(
+                f"'{path}' is corrupted and can't be loaded (likely an interrupted save — "
+                "a crash, OOM, or session drop while it was being written). Delete this file "
+                "and start training again with 'Resume from saved weights' unchecked."
+            ) from first_error
         checkpoint["model_state_dict"] = {
             k: v.detach().cpu() for k, v in checkpoint["model_state_dict"].items()
         }
