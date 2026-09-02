@@ -1940,6 +1940,9 @@ def run_training_session(
     file_path,
     batch_size: int = 8,
     block_size: int = 1024,
+    n_embd: int = 1536,
+    n_head: int = 24,
+    n_layer: int = 34,
     max_steps: int = 200,
     learning_rate: float = 3e-4,
     resume: bool = False,
@@ -1981,7 +1984,7 @@ def run_training_session(
         model.load_state_dict(checkpoint["model_state_dict"])
         start_step = checkpoint.get("step", 0)
     else:
-        config = TechcodeXConfig(block_size=block_size)
+        config = TechcodeXConfig(block_size=block_size, n_embd=n_embd, n_head=n_head, n_layer=n_layer)
         model = TechcodeXModel(config).to(device)
 
     if use_fp16 and _DEVICE_KIND != "xla":
@@ -2301,7 +2304,7 @@ def run_build_dataset(documents, chunk_size, chunk_overlap, min_chunk_size, json
 
 
 def start_training(
-    file_objs, existing_selected, batch_size, block_size, max_steps, learning_rate, resume,
+    file_objs, existing_selected, batch_size, block_size, n_embd, n_head, n_layer, max_steps, learning_rate, resume,
     gradient_checkpointing, gradient_accumulation_steps, use_fp16, offload_optimizer_to_cpu,
     run_name,
 ):
@@ -2318,6 +2321,9 @@ def start_training(
             file_path=file_paths,
             batch_size=int(batch_size),
             block_size=int(block_size),
+            n_embd=int(n_embd),
+            n_head=int(n_head),
+            n_layer=int(n_layer),
             max_steps=int(max_steps),
             learning_rate=float(learning_rate),
             resume=bool(resume),
@@ -2817,6 +2823,7 @@ with gr.Blocks(title="TechcodeX") as demo:
                 fn=start_training,
                 inputs=[
                     file_upload, existing_datasets_checkbox, batch_size_slider, block_size_slider,
+                    n_embd_slider, n_head_slider, n_layer_slider,
                     max_steps_slider, lr_slider, resume_checkbox,
                     gradient_checkpointing_checkbox, gradient_accumulation_slider, use_fp16_checkbox,
                     offload_optimizer_checkbox, run_name_box,
