@@ -67,6 +67,41 @@ python techcodex_single_file.py
 
 Either way, it opens a Gradio dashboard (a public `*.gradio.live` link on Colab, a local URL on Windows).
 
+## Troubleshooting (Colab)
+
+**`ModuleNotFoundError: No module named 'gradio'`** (or transformers/datasets/huggingface_hub) even after running the install cell — the second `pip install` line sometimes silently doesn't take. Just install it directly and verify:
+```python
+!pip install -q gradio
+!python -c "import gradio; print(gradio.__version__)"
+```
+
+**`WARNING: Ignoring invalid distribution ~orch (...)`** — harmless leftover from an earlier interrupted install (a partial `torch` package folder got left behind, showing up as `~orch`). It doesn't mean the current install failed. Optional cleanup:
+```python
+!rm -rf /usr/local/lib/python3.13/dist-packages/~orch*
+```
+
+**`ImportError: ... undefined symbol ...` when importing `torch_xla`** — a torch/torch_xla version mismatch. `torch_xla`'s compiled extension is built against one exact torch release and doesn't declare torch as a pip dependency, so both must be installed together, pinned to the same version:
+```python
+!pip uninstall -y -q torch torch_xla
+!pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" -f https://storage.googleapis.com/libtpu-releases/index.html
+```
+Run `!pip show torch_xla` first if unsure which version is already on the image, and match the `torch==` pin to it.
+
+**No public `*.gradio.live` link, only a `127.0.0.1` local URL** — means the app didn't detect it's running in Colab. This only happens with very old pulls of this repo (fixed by checking Colab's environment variables instead of `sys.modules`, since `!python file.py` runs in a subprocess that doesn't inherit the notebook kernel's injected modules) — pull the latest code.
+
+**Training sits at "Current Step: 0" for several minutes on TPU** — expected. The first step compiles the entire computation graph via XLA before anything executes, which can take minutes for a model this size. It's only actually stuck if there's no cell activity at all after 10+ minutes or an actual `ERROR:`/traceback appears.
+
+**Gradio dashboard didn't pick up a code change** — Gradio doesn't hot-reload. Stop the running cell, re-fetch the code, and restart:
+```python
+%cd /content
+!rm -rf techcodexai-main repo.zip
+!wget -q https://github.com/zarko3/techcodexai/archive/refs/heads/main.zip -O repo.zip
+!unzip -q repo.zip
+%cd techcodexai-main
+!python techcodex_single_file.py
+```
+(If you used `git clone` instead of the zip, `!git pull` works too — but the zip method leaves no `.git` folder, so `git pull` there fails with "not a git repository".)
+
 ## Repo layout
 
 - **`techcodex_single_file.py`** — the whole program, self-contained, for Colab or a quick local run.
