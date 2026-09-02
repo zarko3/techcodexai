@@ -31,6 +31,7 @@ files) needs the Tesseract engine installed separately: `!apt-get install -y
 tesseract-ocr` on Colab, or see setup_env.ps1 on Windows.
 """
 
+import gc
 import hashlib
 import io
 import json
@@ -2299,7 +2300,19 @@ def start_training(
             status = f"Step {step} — loss {loss:.4f} — saving to '{weights_path}'"
             yield step, loss, df, status
     except Exception as e:
-        yield 0, 0.0, pd.DataFrame(history), f"Training failed: {e}"
+        # A failed run can leave the model/optimizer/activation tensors from
+        # this attempt still referenced (Python's exception traceback keeps
+        # every frame's locals alive until the traceback itself is freed),
+        # so PyTorch's CUDA caching allocator never gets a chance to release
+        # them — the next "Start Training" click then starts from an already
+        # half-full GPU. Force a real cleanup before reporting failure so a
+        # retry isn't fighting leftover memory from this one.
+        error_message = str(e)
+        del e
+        gc.collect()
+        if _DEVICE_KIND == "cuda":
+            torch.cuda.empty_cache()
+        yield 0, 0.0, pd.DataFrame(history), f"Training failed: {error_message}"
         return
 
     yield history["step"][-1] if history["step"] else 0, \
