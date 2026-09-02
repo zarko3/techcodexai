@@ -2656,10 +2656,11 @@ with gr.Blocks(title="TechcodeX") as demo:
 
                     with gr.Row():
                         scan_dir_box = gr.Textbox(value="datasets", label="Folder to scan", scale=2)
-                        refresh_datasets_button = gr.Button("Refresh List", scale=1)
-                    existing_datasets_checkbox = gr.CheckboxGroup(
+                        refresh_datasets_button = gr.Button("Refresh", scale=1)
+                    existing_datasets_checkbox = gr.Dropdown(
                         choices=[os.path.relpath(f) for f in list_existing_dataset_files("datasets")],
-                        label="Existing dataset files (check to include in training)",
+                        multiselect=True,
+                        label="Dataset(s) to train on (already prepared — from Tab 0, an HF download, or a previous upload)",
                     )
 
                     gr.Markdown("**Or download a dataset from the Hugging Face Hub:**")
