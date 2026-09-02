@@ -13,8 +13,9 @@ Colab TPU quick start (in a notebook cell, before this file's code):
     # get "undefined symbol" ImportErrors. Check what torch_xla version is
     # already on the image first (`!pip show torch_xla`) and match it below;
     # 2.8.0 is current as of this writing.
-    !pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" -f https://storage.googleapis.com/libtpu-releases/index.html
-    !pip install -q transformers datasets gradio huggingface_hub
+    # Install everything in ONE pip call — splitting torch/torch_xla and the
+    # rest into two separate calls has caused Gradio to silently not install.
+    !pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" transformers datasets gradio huggingface_hub -f https://storage.googleapis.com/libtpu-releases/index.html
 
 Local Windows quick start:
     pip install torch transformers datasets gradio huggingface_hub pymupdf pytesseract Pillow langdetect

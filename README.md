@@ -49,12 +49,11 @@ The training loop adapts to whichever backend it finds — e.g. TPU training use
 !unzip -q repo.zip
 %cd techcodexai-main
 
-!pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" -f https://storage.googleapis.com/libtpu-releases/index.html
-!pip install -q transformers datasets gradio huggingface_hub
+!pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" transformers datasets gradio huggingface_hub -f https://storage.googleapis.com/libtpu-releases/index.html
 
 !python techcodex_single_file.py
 ```
-Set the runtime to TPU first (Runtime → Change runtime type → TPU). Check `!pip show torch_xla` to confirm the version and match the `torch==` pin to it — they must be installed together at the same version, since `torch_xla`'s compiled extension is built against one exact torch release.
+Set the runtime to TPU first (Runtime → Change runtime type → TPU). All packages are installed in **one** `pip install` call — running torch/torch_xla and the rest as two separate calls is what caused Gradio to silently not install in earlier versions of this guide. If `!pip show torch_xla` shows a version other than 2.8.0 already on the image, match the `torch==` pin to it instead — they must be installed together at the same version, since `torch_xla`'s compiled extension is built against one exact torch release.
 
 **Google Colab (GPU/CPU)** — same steps, skip the `torch_xla` install; it'll fall back to CUDA if available, or CPU otherwise.
 
@@ -69,18 +68,12 @@ Either way, it opens a Gradio dashboard (a public `*.gradio.live` link on Colab,
 
 ## Troubleshooting (Colab)
 
-**`ModuleNotFoundError: No module named 'gradio'`** (or transformers/datasets/huggingface_hub) even after running the install cell — the second `pip install` line sometimes silently doesn't take. Just install it directly and verify:
-```python
-!pip install -q gradio
-!python -c "import gradio; print(gradio.__version__)"
-```
-
-**`WARNING: Ignoring invalid distribution ~orch (...)`** — harmless leftover from an earlier interrupted install (a partial `torch` package folder got left behind, showing up as `~orch`). It doesn't mean the current install failed. Optional cleanup:
+**`WARNING: Ignoring invalid distribution ~orch (...)`** during install — harmless leftover from an earlier interrupted install (a partial `torch` package folder got left behind, showing up as `~orch`). It doesn't block the current install. Optional cleanup if it bothers you:
 ```python
 !rm -rf /usr/local/lib/python3.13/dist-packages/~orch*
 ```
 
-**`ImportError: ... undefined symbol ...` when importing `torch_xla`** — a torch/torch_xla version mismatch. `torch_xla`'s compiled extension is built against one exact torch release and doesn't declare torch as a pip dependency, so both must be installed together, pinned to the same version:
+**`ImportError: ... undefined symbol ...` when importing `torch_xla`** — a torch/torch_xla version mismatch (only comes up if you install a different `torch_xla` version than the quick-start command above, or upgrade one without the other). `torch_xla`'s compiled extension is built against one exact torch release and doesn't declare torch as a pip dependency, so both must be installed together, pinned to the same version:
 ```python
 !pip uninstall -y -q torch torch_xla
 !pip install -q torch==2.8.0 "torch_xla[tpu]==2.8.0" -f https://storage.googleapis.com/libtpu-releases/index.html
